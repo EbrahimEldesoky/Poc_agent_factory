@@ -1,0 +1,86 @@
+name: agentfactory
+
+services:
+  db:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_USER: agentfactory
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentfactory}
+      POSTGRES_DB: agentfactory
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentfactory"]
+      interval: 3s
+      retries: 20
+    networks: [platform]
+
+  # The ONLY service that gets the Docker socket.
+  broker:
+    build: ./broker
+    environment:
+      BROKER_TOKEN: ${BROKER_TOKEN}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Claude subscription token from `claude setup-token` (used instead of the API key when set)
+      ANTHROPIC_OAUTH_TOKEN: ${ANTHROPIC_OAUTH_TOKEN:-}
+      OPENCLAW_IMAGE: ghcr.io/openclaw/openclaw:2026.11.2@sha256:55294524dac01370288fb4beb16714b60f75cec0e96e07e662054cf29900965a
+      HERMES_IMAGE: nousresearch/hermes-agent:v0.23.0@sha256:adb7890916de63245523492be8f68f9d2095fecbec4e2a6dab7960381f0fc002
+      EGRESS_CONTAINER: af-egress
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - secrets:/secrets
+    networks: [platform]
+    restart: unless-stopped
+
+  # No Docker socket, no secrets, no model key. Hosts AgentFather (guided questionnaire).
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql://agentfactory:${POSTGRES_PASSWORD:-agentfactory}@db:5432/agentfactory
+      BROKER_URL: http://broker:8100
+      BROKER_TOKEN: ${BROKER_TOKEN}
+      SESSION_SECRET: ${SESSION_SECRET}
+      OWNER_EMAIL: ${OWNER_EMAIL:-owner@acme.test}
+      OWNER_PASSWORD: ${OWNER_PASSWORD:-changeme}
+    depends_on:
+      db: { condition: service_healthy }
+      broker: { condition: service_started }
+    networks: [platform]
+    restart: unless-stopped
+
+  # Job worker: same image as the API, long-running CLI process. No Docker socket either.
+  worker:
+    build: ./api
+    command: ["php", "src/worker.php"]
+    environment:
+      DATABASE_URL: postgresql://agentfactory:${POSTGRES_PASSWORD:-agentfactory}@db:5432/agentfactory
+      BROKER_URL: http://broker:8100
+      BROKER_TOKEN: ${BROKER_TOKEN}
+      OWNER_EMAIL: ${OWNER_EMAIL:-owner@acme.test}
+      OWNER_PASSWORD: ${OWNER_PASSWORD:-changeme}
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [platform]
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    ports:
+      - "${WEB_PORT:-3000}:80"
+    depends_on: [api]
+    networks: [platform]
+
+  # Egress allowlist for agent containers: only the model provider and Telegram.
+  egress:
+    build: ./egress
+    container_name: af-egress
+    networks: [egress]
+    restart: unless-stopped
+
+networks:
+  platform: {}
+  egress: {}
+
+volumes:
+  dbdata: {}
+  secrets: {}
