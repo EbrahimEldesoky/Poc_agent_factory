@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents · Agent Factory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand"><span class="logo">AF</span> Agent Factory</div>
+    <nav><a class="active" href="/">Agents</a></nav>
+    <div class="sidebar-foot"><span id="me"></span><button class="link" id="logout">Sign out</button></div>
+  </aside>
+  <main class="main" id="main">
+    <section class="content">
+      <header class="page-head">
+        <h1>Agents</h1>
+        <button class="btn primary" id="create">Create agent</button>
+      </header>
+      <div class="panel">
+        <table class="agents" id="table">
+          <thead><tr><th>Agent</th><th>Channel</th><th>State</th><th>Last message</th><th>On / off</th><th>Actions</th></tr></thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <p class="empty" id="empty" hidden>No agents yet. Click Create agent to talk to AgentFather.</p>
+      </div>
+    </section>
+    <aside class="side" id="side" hidden>
+      <div class="side-head"><h2 id="side-title">AgentFather</h2><button class="icon" id="close" aria-label="Close">✕</button></div>
+      <div class="side-body" id="side-body"></div>
+      <form class="composer" id="composer" hidden>
+        <input id="msg" autocomplete="off" placeholder="Type your answer…">
+        <button class="btn primary" type="submit">Send</button>
+      </form>
+    </aside>
+  </main>
+</div>
+<dialog id="confirm-del">
+  <form method="dialog">
+    <h3>Delete agent?</h3>
+    <p>This stops <b id="del-name"></b>, removes its container and disconnects its channel. This cannot be undone.</p>
+    <div class="row-btns"><button class="btn" value="cancel">Cancel</button><button class="btn danger" value="ok">Delete</button></div>
+  </form>
+</dialog>
+<script src="/qrcode.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
