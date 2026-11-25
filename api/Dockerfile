@@ -3,6 +3,7 @@ RUN apk add --no-cache postgresql-libs \
  && apk add --no-cache --virtual .build postgresql-dev \
  && docker-php-ext-install pdo_pgsql \
  && apk del .build \
+ && php -r 'foreach (["pdo_pgsql", "curl", "mbstring", "json"] as $ext) { if (!extension_loaded($ext)) { fwrite(STDERR, "Missing PHP extension: $ext\n"); exit(1); } }' \
  && adduser -D -u 10001 app
 WORKDIR /app
 COPY src ./src
