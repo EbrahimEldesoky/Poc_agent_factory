@@ -1,2 +1,4 @@
 ^api\.anthropic\.com$
+^generativelanguage\.googleapis\.com$
+^api\.groq\.com$
 ^api\.telegram\.org$

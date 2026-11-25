@@ -23,6 +23,8 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       # Claude subscription token from `claude setup-token` (used instead of the API key when set)
       ANTHROPIC_OAUTH_TOKEN: ${ANTHROPIC_OAUTH_TOKEN:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
       OPENCLAW_IMAGE: ghcr.io/openclaw/openclaw:2026.11.2@sha256:55294524dac01370288fb4beb16714b60f75cec0e96e07e662054cf29900965a
       HERMES_IMAGE: nousresearch/hermes-agent:v0.23.0@sha256:adb7890916de63245523492be8f68f9d2095fecbec4e2a6dab7960381f0fc002
       EGRESS_CONTAINER: af-egress

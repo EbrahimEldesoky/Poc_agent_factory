@@ -22,6 +22,8 @@ const AF_MODELS = [
     'Claude Opus 5.5 (most capable, slower)' => 'claude-opus-5-5',
     'Claude Haiku 5.5 (fastest)' => 'claude-haiku-5-5',
     'Claude Sonnet 4.6' => 'claude-sonnet-4-6',
+    'Gemini 3.8 Flash' => 'gemini-3-8-flash',
+    'Groq GPT OSS 120B' => 'groq-gpt-oss-120b',
 ];
 const AF_ACCESS_ANYONE = 'Anyone with the QR code or link';
 const AF_ACCESS_LIST = 'Only people I list';
@@ -96,7 +98,7 @@ function af_questions(): array
         ],
         'model' => [
             'label' => 'Model', 'kind' => 'single', 'other' => false,
-            'text' => 'Which Claude model should it use?',
+            'text' => 'Which AI model should it use?',
             'options' => array_keys(AF_MODELS),
         ],
         'channel' => [
@@ -122,7 +124,8 @@ function af_questions(): array
 function redact(string $text): string
 {
     $text = preg_replace('/\b\d{5,15}:[A-Za-z0-9_-]{30,50}\b/', '[redacted secret]', $text); // Telegram bot token
-    return preg_replace('/sk-[A-Za-z0-9_\-]{20,}/', '[redacted secret]', $text);              // provider keys
+    $text = preg_replace('/sk-[A-Za-z0-9_\-]{20,}/', '[redacted secret]', $text);              // provider keys
+    return preg_replace('/\bAIza[A-Za-z0-9_\-]{20,}\b|\bgsk_[A-Za-z0-9_\-]{20,}\b/', '[redacted secret]', $text);
 }
 
 function af_applicable(string $id, array $answers): bool
