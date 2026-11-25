@@ -1,13 +1,14 @@
 <?php
 declare(strict_types=1);
 /* Job worker: a long-running CLI process (compose service "worker", same image as the API). */
+require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/jobs.php';
 
+assert_api_config(false);
 db_init();
-// Jobs left 'running' by a crashed worker are failed cleanly; the owner retries with the switch.
-foreach (q("SELECT * FROM jobs WHERE state IN ('running','rolling_back')") as $j) {
-    q("UPDATE jobs SET state='failed', error='Interrupted by a platform restart' WHERE id=?", $j['id']);
-    set_agent($j['agent_id'], ['state' => 'failed', 'enabled' => false, 'state_reason' => 'Interrupted by a platform restart']);
+$recovered = recover_interrupted_jobs(true);
+if ($recovered > 0) {
+    fwrite(STDERR, "worker recovered $recovered interrupted job(s)\n");
 }
 fwrite(STDERR, "worker started\n");
 $lastReconcile = 0.0;
@@ -19,6 +20,7 @@ while (true) {
             continue;
         }
         if (microtime(true) - $lastReconcile > 5) {
+            recover_interrupted_jobs(false);
             reconcile();
             $lastReconcile = microtime(true);
         }
