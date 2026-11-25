@@ -8,7 +8,7 @@ isolated [OpenClaw](https://docs.openclaw.ai) container, reach it on Telegram, a
 Requirements: Docker (with Compose). Nothing else on the host.
 
 ```bash
-cp .env.example .env      # fill ANTHROPIC_API_KEY, BROKER_TOKEN, SESSION_SECRET
+cp .env.example .env      # fill the selected provider key plus BROKER_TOKEN and SESSION_SECRET
 docker compose up -d --build
 open http://localhost:3000   # sign in: owner@acme.test / changeme (from .env)
 ```
@@ -26,8 +26,8 @@ and paste it in the token field of the AgentFather summary.
 1. Sign in → empty list.
 2. **Create agent** → AgentFather asks its questions one at a time, with clickable choices or free text:
    main job, company, agent name, what it must know, tone, language, prohibited tasks, what to do
-   when it can't help (+ contact), **runtime** (OpenClaw or Hermes Agent), **model** (Claude Sonnet 5.5,
-   Opus 5.5, Haiku 5.5, Sonnet 4.6), channel, and **who can talk to it** (anyone with the QR code, or
+   when it can't help (+ contact), **runtime** (OpenClaw or Hermes Agent), **model** (Claude, Gemini 3.8 Flash,
+   or Groq GPT OSS 120B), channel, and **who can talk to it** (anyone with the QR code, or
    only listed Telegram user IDs).
 3. Summary (with **Change** to edit one answer) → create a bot with @BotFather (a QR code opens it on
    your phone) → paste the token → **Confirm**. The panel shows the deploy steps; the row goes
@@ -61,7 +61,7 @@ Browser ──► web (nginx + TypeScript page) ──► api (PHP + AgentFather
 | `worker` | PHP CLI loop: runs jobs (Postgres `FOR UPDATE SKIP LOCKED`), reconciles states, records events | no | no |
 | `db` | Postgres: `users`, `agents`, `agentfather_sessions`, `jobs`, `events` | no | no |
 | `broker` | PHP 8.3: validates the agent manifest, drives the Docker Engine API over the unix socket, secrets store | **yes** | model key + bot tokens |
-| `egress` | Forward proxy, default deny, two hosts allowed | no | no |
+| `egress` | Forward proxy, default deny, provider API hosts and Telegram allowed | no | no |
 
 ### How a create works
 
@@ -85,7 +85,7 @@ Browser ──► web (nginx + TypeScript page) ──► api (PHP + AgentFather
 |---|---|
 | Only the broker talks to Docker | Socket mounted only in `broker`. Agents get no socket (verified). |
 | One container per agent, limits, non-root, read-only | `af-agent-<id>`, uid 1000, `read_only`, tmpfs `/tmp`, `cap_drop: ALL`, `no-new-privileges`, 1 vCPU, 2 GB, 512 pids, own volume |
-| Default deny | `tools: { profile: "minimal", deny: ["*"] }`. Egress: internal network + allowlist proxy (Google is blocked, verified) |
+| Default deny | `tools: { profile: "minimal", deny: ["*"] }`. Egress: internal network + allowlist proxy restricted to supported model API hosts and Telegram |
 | Permissions outside the model | No tools at all, so the agent cannot *do* anything beyond chatting. Prohibited tasks are also written as "Red Lines" in `AGENTS.md`. |
 | Secrets never appear | Token only in the broker's secrets volume (0600) and the agent's env. API redacts token/key patterns from chat; validation errors never echo input; access logs off. |
 | Pinned versions | OpenClaw tag + digest; all base images pinned. |
@@ -103,8 +103,9 @@ Browser ──► web (nginx + TypeScript page) ──► api (PHP + AgentFather
   toolset disabled for Telegram (`platform_toolsets.telegram: []` + `agent.disabled_toolsets`), its
   persona in `/opt/data/SOUL.md`, and health read from `/opt/data/gateway_state.json`
   (`platforms.telegram.state == "connected"`).
-- **Model credentials**: a Claude subscription token (`ANTHROPIC_OAUTH_TOKEN`, from `claude setup-token`)
-  or an API key. OpenClaw 2026.5.22 was rejected by Anthropic with a subscription token ("third-party
+- **Model credentials**: configure the selected provider key in `.env`: `ANTHROPIC_API_KEY` or
+  `ANTHROPIC_OAUTH_TOKEN` for Claude, `GEMINI_API_KEY` for Gemini, or `GROQ_API_KEY` for Groq.
+  The broker passes only that provider's credential to an agent. OpenClaw 2026.5.22 was rejected by Anthropic with a subscription token ("third-party
   apps draw from extra usage"); 2026.11.2 is accepted.
 - **Stack**: PHP 8.3 backend (API, worker, broker) and a TypeScript front, at the owner's request,
   instead of the brief's FastAPI + Next.js. No framework: one router file per service, PDO for

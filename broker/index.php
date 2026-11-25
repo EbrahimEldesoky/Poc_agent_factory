@@ -16,7 +16,7 @@ const SOCK = '/var/run/docker.sock';
 const SECRET_REF_RE = '/^sec_[a-f0-9]{32}$/';
 // Allowed values, fixed by the platform. The API's AgentFather offers exactly these.
 const RUNTIMES = ['openclaw', 'hermes'];
-const MODELS = ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-sonnet-4-6'];
+const MODELS = ['claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-sonnet-4-6', 'gemini-3-8-flash', 'groq-gpt-oss-120b'];
 const TELEGRAM_TOKEN_RE = '/^\d{5,15}:[A-Za-z0-9_-]{30,50}$/';
 
 final class HttpError extends RuntimeException {}
@@ -153,8 +153,25 @@ function agents_md(array $m): string
     return implode("\n", $lines);
 }
 
+function model_spec(string $model): array
+{
+    return match ($model) {
+        'claude-sonnet-5-5', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-sonnet-4-6' => [
+            'provider' => 'anthropic', 'openclaw' => 'anthropic/' . $model, 'hermes' => $model,
+        ],
+        'gemini-3-8-flash' => [
+            'provider' => 'gemini', 'openclaw' => 'google/gemini-3.8-flash', 'hermes' => 'gemini-3.8-flash',
+        ],
+        'groq-gpt-oss-120b' => [
+            'provider' => 'groq', 'openclaw' => 'groq/openai/gpt-oss-120b', 'hermes' => 'openai/gpt-oss-120b',
+        ],
+        default => fail(422, 'manifest: model not allowed'),
+    };
+}
+
 function openclaw_config(array $m): string
 {
+    $model = model_spec($m['model']);
     // Who may DM the bot: everyone, or only the listed numeric Telegram user ids.
     $telegram = $m['allowed_users']
         ? ['enabled' => true, 'dmPolicy' => 'allowlist', 'allowFrom' => $m['allowed_users']]
@@ -162,10 +179,29 @@ function openclaw_config(array $m): string
     return json_encode([
         'gateway' => ['mode' => 'local', 'bind' => 'loopback', 'auth' => ['mode' => 'token', 'token' => '${OPENCLAW_GATEWAY_TOKEN}']],
         'agents' => ['defaults' => [
-            'model' => ['primary' => 'anthropic/' . $m['model']],
+            'model' => ['primary' => $model['openclaw']],
             'workspace' => STATE_DIR . '/workspace',
             'skipBootstrap' => true,
         ]],
+        'models' => match ($model['provider']) {
+            'gemini' => ['providers' => ['google' => [
+                'baseUrl' => 'https://generativelanguage.googleapis.com/v1beta', 'apiKey' => '${GEMINI_API_KEY}',
+                'api' => 'google-generative-ai', 'models' => [[
+                    'id' => 'gemini-3.8-flash', 'name' => 'Gemini 3.8 Flash',
+                    'contextWindow' => 1048576, 'maxTokens' => 65536, 'reasoning' => true,
+                    'input' => ['text'],
+                ]],
+            ]]],
+            'groq' => ['providers' => ['groq' => [
+                'baseUrl' => 'https://api.groq.com/openai/v1', 'apiKey' => '${GROQ_API_KEY}',
+                'api' => 'openai-completions', 'models' => [[
+                    'id' => 'openai/gpt-oss-120b', 'name' => 'GPT OSS 120B',
+                    'contextWindow' => 131072, 'maxTokens' => 65536, 'reasoning' => true,
+                    'input' => ['text'],
+                ]],
+            ]]],
+            default => new stdClass(),
+        },
         // Default deny: no tool is enabled in the POC form, so none is available.
         'tools' => ['profile' => 'minimal', 'deny' => ['*']],
         'channels' => ['telegram' => $telegram],
@@ -179,12 +215,13 @@ const HERMES_TOOLSETS = ['web', 'browser', 'terminal', 'file', 'code_execution',
 
 function hermes_config(array $m): string
 {
+    $model = model_spec($m['model']);
     // Same shape `hermes tools disable --platform telegram ...` writes, plus a global disable as a second lock.
     $lines = [
         '_config_version: 52',
         'model:',
-        '  provider: anthropic',
-        '  default: ' . $m['model'],
+        '  provider: ' . ($model['provider'] === 'groq' ? 'custom:groq' : $model['provider']),
+        '  default: ' . $model['hermes'],
         'platform_toolsets:',
         '  telegram: []',
         'agent:',
@@ -194,20 +231,36 @@ function hermes_config(array $m): string
         '  user_profile_enabled: false',
         '',
     ];
+    if ($model['provider'] === 'gemini') {
+        array_splice($lines, 4, 0, ['  base_url: https://generativelanguage.googleapis.com/v1beta']);
+    }
+    if ($model['provider'] === 'groq') {
+        array_splice($lines, 4, 0, [
+            'providers:', '  groq:', '    api: https://api.groq.com/openai/v1', '    key_env: GROQ_API_KEY',
+        ]);
+    }
     return implode("\n", $lines);
 }
 
 /** Everything that differs between the two runtimes. Images are pinned by digest. */
 function runtime_spec(array $m, string $vname): array
 {
+    $model = model_spec($m['model']);
     $oauth = getenv('ANTHROPIC_OAUTH_TOKEN') ?: '';
     $apiKey = getenv('ANTHROPIC_API_KEY') ?: '';
-    if ($oauth === '' && $apiKey === '') fail(500, 'Model provider credentials are not configured on the platform.');
+    $geminiKey = getenv('GEMINI_API_KEY') ?: '';
+    $groqKey = getenv('GROQ_API_KEY') ?: '';
+    $modelEnv = match ($model['provider']) {
+        'anthropic' => $oauth !== '' ? "ANTHROPIC_TOKEN=$oauth" : ($apiKey !== '' ? "ANTHROPIC_API_KEY=$apiKey" : ''),
+        'gemini' => $geminiKey !== '' ? "GEMINI_API_KEY=$geminiKey" : '',
+        'groq' => $groqKey !== '' ? "GROQ_API_KEY=$groqKey" : '',
+    };
+    if ($modelEnv === '') fail(500, 'The selected model provider API key is not configured on the platform.');
     if ($m['runtime'] === 'hermes') {
         return [
             'image' => getenv('HERMES_IMAGE'), 'uid' => 10000, 'dir' => '/opt/data',
             // Claude subscription token (claude setup-token) wins over an API key.
-            'env' => [$oauth !== '' ? "ANTHROPIC_TOKEN=$oauth" : "ANTHROPIC_API_KEY=$apiKey",
+            'env' => [$modelEnv,
                       'HERMES_GATEWAY_NO_SUPERVISE=1',
                       $m['allowed_users'] ? 'TELEGRAM_ALLOWED_USERS=' . implode(',', $m['allowed_users']) : 'GATEWAY_ALLOW_ALL_USERS=true'],
             // Run the gateway directly as the unprivileged hermes user (no root s6 init, no capabilities).
@@ -219,7 +272,7 @@ function runtime_spec(array $m, string $vname): array
     }
     return [
         'image' => getenv('OPENCLAW_IMAGE'), 'uid' => 1000, 'dir' => STATE_DIR,
-        'env' => [$oauth !== '' ? "ANTHROPIC_OAUTH_TOKEN=$oauth" : "ANTHROPIC_API_KEY=$apiKey",
+        'env' => [$modelEnv,
                   'OPENCLAW_GATEWAY_TOKEN=' . bin2hex(random_bytes(24)), 'NODE_USE_ENV_PROXY=1'],
         'entrypoint' => null, 'cmd' => null,
         'health' => ['CMD-SHELL', "node -e \"fetch('http://127.0.0.1:18789/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""],
