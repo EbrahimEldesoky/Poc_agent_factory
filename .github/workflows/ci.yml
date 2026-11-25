@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "hardening/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mbstring, curl, json
+          tools: none
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Lint PHP files
+        run: find api broker tests -name '*.php' -print0 | xargs -0 -n1 php -l
+
+      - name: Run daemon-free unit and contract tests
+        run: php tests/run.php
+
+      - name: TypeScript typecheck (strict mode)
+        run: |
+          cd web
+          npm ci
+          npx tsc -p tsconfig.json --noEmit
+
+      - name: Validate Docker Compose YAML
+        run: docker compose config -q

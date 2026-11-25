@@ -28,7 +28,9 @@ const HERMES_TOOLSETS = [
     'connections', 'clarify', 'delegation', 'cronjob', 'yuanbao', 'computer_use', 'discord', 'discord_admin', 'a2a',
 ];
 
-final class HttpError extends RuntimeException {}
+if (!class_exists('HttpError')) {
+    final class HttpError extends RuntimeException {}
+}
 
 function fail(int $code, string $detail): never
 {
