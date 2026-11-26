@@ -1,4 +1,7 @@
 FROM php:8.3.14-cli-alpine3.20
+# Apply Alpine security updates at build time (base images lag behind the patched packages).
+# hadolint ignore=DL3017
+RUN apk upgrade --no-cache
 RUN php -r 'foreach (["curl", "mbstring", "json"] as $ext) { if (!extension_loaded($ext)) { fwrite(STDERR, "Missing PHP extension: $ext\n"); exit(1); } }'
 WORKDIR /app
 COPY lib.php index.php ./

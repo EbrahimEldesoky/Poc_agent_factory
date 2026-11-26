@@ -1,5 +1,8 @@
 FROM php:8.3.14-cli-alpine3.20
-RUN apk add --no-cache libpq \
+# Apply Alpine security updates at build time (base images lag behind the patched packages).
+# hadolint ignore=DL3017,DL3018
+RUN apk upgrade --no-cache \
+ && apk add --no-cache libpq \
  && apk add --no-cache --virtual .build libpq-dev \
  && docker-php-ext-install pdo_pgsql \
  && apk del .build \
