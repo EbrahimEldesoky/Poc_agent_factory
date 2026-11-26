@@ -5,3 +5,4 @@ IMG_*.PNG
 *.pdf
 web/node_modules/
 web/dist/
+.env.bak-*

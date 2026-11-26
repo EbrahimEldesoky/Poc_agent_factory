@@ -88,6 +88,141 @@ type Side =
   | {mode: 'chat'; session: Session | null; busy: boolean; error: string | null; picked: Set<string>}
   | {mode: 'deploy' | 'log' | 'qr'; agentId: string};
 
+// ---------------------------------------------------------------- model providers
+type ProviderId = 'anthropic' | 'gemini' | 'groq';
+
+interface ProviderStatus {
+  id: ProviderId;
+  configured: boolean;
+  source: 'page' | 'env' | null;
+  kind: 'api_key' | 'oauth' | null;
+}
+
+// Simple original icons in each provider's colours (not the official logos).
+const ICON_CLAUDE = `<svg viewBox="0 0 40 40" aria-hidden="true"><rect width="40" height="40" rx="11" fill="#D97757"/>
+  <g stroke="#fff" stroke-width="3.2" stroke-linecap="round">${[0, 22.5, 45, 67.5, 90, 112.5, 135, 157.5].map((a) =>
+    `<line x1="20" y1="9" x2="20" y2="31" transform="rotate(${a} 20 20)"/>`).join('')}</g></svg>`;
+const ICON_GEMINI = `<svg viewBox="0 0 40 40" aria-hidden="true"><defs><linearGradient id="gem" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0" stop-color="#4285F4"/><stop offset=".55" stop-color="#9B72CB"/><stop offset="1" stop-color="#D96570"/></linearGradient></defs>
+  <rect width="40" height="40" rx="11" fill="#EEF2FE"/>
+  <path d="M20 6 C21.2 14 26 18.8 34 20 C26 21.2 21.2 26 20 34 C18.8 26 14 21.2 6 20 C14 18.8 18.8 14 20 6Z" fill="url(#gem)"/></svg>`;
+const ICON_GROQ = `<svg viewBox="0 0 40 40" aria-hidden="true"><rect width="40" height="40" rx="11" fill="#F55036"/>
+  <circle cx="20" cy="17.5" r="7" fill="none" stroke="#fff" stroke-width="3.4"/>
+  <path d="M27 17.5 V25 a6.5 6.5 0 0 1 -11.5 4" fill="none" stroke="#fff" stroke-width="3.4" stroke-linecap="round"/></svg>`;
+
+const PROVIDERS: Record<ProviderId, {name: string; by: string; icon: string; models: string; placeholder: string; help: string}> = {
+  anthropic: {
+    name: 'Claude', by: 'Anthropic', icon: ICON_CLAUDE,
+    models: 'Sonnet 5.5 · Opus 5.5 · Haiku 5.5 · Sonnet 4.6',
+    placeholder: 'sk-ant-api… or sk-ant-oat…',
+    help: 'An API key from <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>, or a Claude subscription token from <code>claude setup-token</code>.',
+  },
+  gemini: {
+    name: 'Gemini', by: 'Google', icon: ICON_GEMINI,
+    models: 'Gemini 3.8 Flash',
+    placeholder: 'AIza…',
+    help: 'Free API key from <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio</a>.',
+  },
+  groq: {
+    name: 'Groq', by: 'Groq', icon: ICON_GROQ,
+    models: 'GPT OSS 120B',
+    placeholder: 'gsk_…',
+    help: 'Free API key from <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com</a>.',
+  },
+};
+
+let providers: ProviderStatus[] = [];
+const provState: {notice: string | null; busy: ProviderId | null; error: {id: ProviderId; msg: string} | null} =
+  {notice: null, busy: null, error: null};
+
+/** Two tabs: the agents list and the model providers page. */
+function showView(view: 'agents' | 'providers'): void {
+  $('#view-agents').hidden = view !== 'agents';
+  $('#view-providers').hidden = view !== 'providers';
+  $('#nav-agents').classList.toggle('active', view === 'agents');
+  $('#nav-providers').classList.toggle('active', view === 'providers');
+  if (view === 'providers' && side) closeSide();
+  const hash = view === 'providers' ? '#providers' : '';
+  if (location.hash !== hash) history.replaceState(null, '', location.pathname + hash);
+}
+
+async function loadProviders(): Promise<ProviderStatus[]> {
+  providers = await api<ProviderStatus[]>('/providers');
+  return providers;
+}
+
+function providerBadge(p: ProviderStatus): string {
+  if (!p.configured) return '<span class="badge inactive">Not connected</span>';
+  const how = p.kind === 'oauth' ? 'subscription' : 'API key';
+  return `<span class="badge active">Connected · ${how}${p.source === 'env' ? ' (.env)' : ''}</span>`;
+}
+
+function renderProviders(): void {
+  const st = provState;
+  const cards = providers.map((p) => {
+    const meta = PROVIDERS[p.id];
+    const busy = st.busy === p.id;
+    const err = st.error?.id === p.id ? `<p class="error">${esc(st.error.msg)}</p>` : '';
+    return `<div class="prov-card ${p.configured ? 'on' : ''}">
+      <div class="prov-head">
+        <span class="prov-icon">${meta.icon}</span>
+        <div class="prov-title"><b>${meta.name}</b><span class="muted">by ${meta.by}</span></div>
+        ${providerBadge(p)}
+      </div>
+      <div class="prov-models">${esc(meta.models)}</div>
+      <form class="prov-form" data-provider="${p.id}">
+        <input type="password" name="key" autocomplete="off" spellcheck="false" placeholder="${esc(meta.placeholder)}" ${busy ? 'disabled' : ''}>
+        <button class="btn primary small" type="submit" ${busy ? 'disabled' : ''}>${busy ? 'Checking…' : p.configured ? 'Replace' : 'Add'}</button>
+      </form>
+      <p class="muted small">${meta.help}</p>
+      ${err}
+      ${p.configured ? `<button class="btn small danger-outline" data-disconnect="${p.id}">Remove</button>` : ''}
+    </div>`;
+  }).join('');
+  $('#prov-notice').textContent = st.notice ?? '';
+  $('#prov-notice').hidden = !st.notice;
+  $('#prov-grid').innerHTML = cards;
+  $('#prov-create').hidden = !providers.some((p) => p.configured);
+}
+
+async function openProviders(notice: string | null = null): Promise<void> {
+  provState.notice = notice;
+  provState.error = null;
+  showView('providers');
+  try {
+    await loadProviders();
+  } catch (e) {
+    $('#prov-grid').innerHTML = `<p class="error">${esc((e as Error).message)}</p>`;
+    return;
+  }
+  renderProviders();
+}
+
+async function connectProvider(id: ProviderId, key: string): Promise<void> {
+  provState.busy = id;
+  provState.error = null;
+  renderProviders();
+  try {
+    providers = await api<ProviderStatus[]>(`/providers/${id}`, {method: 'PUT', body: {key}});
+    provState.notice = `${PROVIDERS[id].name} is connected. Its models now appear when you create an agent.`;
+  } catch (err) {
+    provState.error = {id, msg: (err as Error).message};
+  }
+  provState.busy = null;
+  renderProviders();
+}
+
+async function disconnectProvider(id: ProviderId): Promise<void> {
+  if (!confirm(`Remove ${PROVIDERS[id].name}? New agents can no longer use it. Running agents keep working until they are switched off and on.`)) return;
+  try {
+    providers = await api<ProviderStatus[]>(`/providers/${id}`, {method: 'DELETE'});
+    provState.notice = `${PROVIDERS[id].name} was removed.`;
+  } catch (err) {
+    provState.error = {id, msg: (err as Error).message};
+  }
+  renderProviders();
+}
+
 // qrcode-generator@1.4.4 (loaded from /qrcode.js, bundled at build time).
 declare function qrcode(typeNumber: number, errorCorrectionLevel: 'L' | 'M' | 'Q' | 'H'): {
   addData(data: string): void;
@@ -223,6 +358,16 @@ function closeSide(): void {
 }
 
 async function startChat(): Promise<void> {
+  try {
+    await loadProviders();
+  } catch {
+    /* the session call below reports the error */
+  }
+  if (providers.length && !providers.some((p) => p.configured)) {
+    void openProviders('Connect a model provider first: your agent needs an AI model to answer.');
+    return;
+  }
+  showView('agents');
   const chat: Side = {mode: 'chat', session: null, busy: false, error: null, picked: new Set()};
   side = chat;
   openSide('AgentFather');
@@ -377,6 +522,28 @@ async function renderAgentSide(): Promise<void> {
 
 // ---------------------------------------------------------------- events
 $('#create').addEventListener('click', () => void startChat());
+$('#nav-providers').addEventListener('click', (e) => {
+  e.preventDefault();
+  void openProviders();
+});
+$('#nav-agents').addEventListener('click', (e) => {
+  e.preventDefault();
+  showView('agents');
+});
+$('#prov-create').addEventListener('click', () => void startChat());
+$('#prov-grid').addEventListener('click', (e) => {
+  const id = (e.target as HTMLElement).closest<HTMLElement>('[data-disconnect]')?.dataset.disconnect as ProviderId | undefined;
+  if (id) void disconnectProvider(id);
+});
+$('#prov-grid').addEventListener('submit', (e) => {
+  const form = (e.target as HTMLElement).closest<HTMLFormElement>('.prov-form');
+  if (!form) return;
+  e.preventDefault();
+  const input = form.querySelector<HTMLInputElement>('input[name=key]');
+  const key = input?.value.trim() ?? '';
+  if (input) input.value = '';
+  if (key) void connectProvider(form.dataset.provider as ProviderId, key);
+});
 $('#close').addEventListener('click', closeSide);
 $('#logout').addEventListener('click', async () => {
   await api('/logout', {method: 'POST'});
@@ -464,5 +631,15 @@ void (async () => {
   csrfToken = me.csrf_token ?? '';
   $('#me').textContent = me.email;
   await refresh();
+  try {
+    const list = await loadProviders();
+    if (!list.some((p) => p.configured)) {
+      void openProviders('Welcome! Start by choosing the AI providers your agents can use: Claude, Gemini or Groq.');
+    } else if (location.hash === '#providers') {
+      void openProviders();
+    }
+  } catch (e) {
+    console.error(e);
+  }
   setInterval(() => void refresh(), 2000);
 })();

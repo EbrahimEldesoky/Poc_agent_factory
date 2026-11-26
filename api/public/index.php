@@ -191,6 +191,67 @@ if ($route('GET', '/api/me')) {
     json_out(['email' => $u['email'], 'role' => $u['role'], 'csrf_token' => $u['csrf_token']]);
 }
 
+// ---------------------------------------------------------------- model providers
+// Keys go straight to the broker's secrets store; the API only ever sees connected yes/no.
+const PROVIDER_IDS = ['anthropic', 'gemini', 'groq'];
+
+function providers_list(): array
+{
+    try {
+        $rows = broker('GET', '/providers');
+    } catch (StepError) {
+        fail(502, 'Deployment broker unreachable');
+    }
+    return array_values(array_map(fn($r) => [
+        'id' => (string)$r['id'], 'configured' => (bool)$r['configured'],
+        'source' => $r['source'] ?? null, 'kind' => $r['kind'] ?? null,
+    ], array_filter($rows, fn($r) => in_array($r['id'] ?? '', PROVIDER_IDS, true))));
+}
+
+function enabled_providers(): array
+{
+    return array_values(array_map(fn($r) => $r['id'], array_filter(providers_list(), fn($r) => $r['configured'])));
+}
+
+if ($route('GET', '/api/providers')) {
+    json_out(providers_list());
+}
+
+if ($route('PUT', '/api/providers/([a-z]+)')) {
+    if (!in_array($m[1], PROVIDER_IDS, true)) {
+        fail(404, 'Unknown provider');
+    }
+    $key = body()['key'] ?? null;
+    if (!is_string($key) || trim($key) === '' || strlen($key) > 400) {
+        fail(422, 'Paste the API key.');
+    }
+    try {
+        broker('PUT', '/providers/' . $m[1], ['value' => $key]);
+    } catch (StepError $e) {
+        $code = $e->getCode();
+        fail($code >= 400 && $code < 500 ? $code : 502, $e->getMessage());
+    }
+    event($u['tenant_id'], null, 'provider_connected', 'completed', $m[1]);
+    json_out(providers_list());
+}
+
+if ($route('DELETE', '/api/providers/([a-z]+)')) {
+    if (!in_array($m[1], PROVIDER_IDS, true)) {
+        fail(404, 'Unknown provider');
+    }
+    try {
+        broker('DELETE', '/providers/' . $m[1]);
+    } catch (StepError $e) {
+        fail(502, $e->getMessage());
+    }
+    event($u['tenant_id'], null, 'provider_disconnected', 'completed', $m[1]);
+    json_out(providers_list());
+}
+
+if (str_starts_with((string)$path, '/api/agentfather/')) {
+    $GLOBALS['af_enabled_providers'] = enabled_providers();
+}
+
 if ($route('GET', '/api/agents')) {
     $rows = q("SELECT * FROM agents WHERE tenant_id=? AND state <> 'deleted' ORDER BY created_at DESC", $u['tenant_id']);
     json_out(array_map(fn($a) => public_agent($a, active_job($a['id'], $u['tenant_id'])), $rows));
@@ -239,6 +300,9 @@ if ($route('DELETE', '/api/agents/([0-9a-f-]+)')) {
 }
 
 if ($route('POST', '/api/agentfather/sessions')) {
+    if ($GLOBALS['af_enabled_providers'] === []) {
+        fail(409, 'Connect a model provider first (Claude, Gemini or Groq).');
+    }
     $sid = uuid4();
     $first = af_next([]);
     $msgs = [['role' => 'assistant', 'content' => AF_GREETING], ['role' => 'assistant', 'content' => af_prompt($first)]];

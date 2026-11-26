@@ -188,6 +188,40 @@ function remove_all(string $id, ?callable $transport = null, ?string $egressCont
     $assertGone('DELETE', "/volumes/$v", $code, $res);
 }
 
+/**
+ * Re-attaches the egress proxy to every agent network it should serve.
+ * Recreating the egress container (deploy, rebuild) drops its network links, which would
+ * silently cut every running agent off from its model and Telegram. Idempotent.
+ * Only networks labelled for this egress (or unlabelled legacy networks when using the
+ * default egress name) are touched, so a second stack on the same host is left alone.
+ *
+ * @return int number of networks that had to be re-attached
+ */
+function ensure_egress_links(?callable $transport = null, ?string $egressContainer = null): int
+{
+    $egress = $egressContainer ?? (getenv('EGRESS_CONTAINER') ?: 'af-egress');
+    $filters = rawurlencode(json_encode(['label' => ['af.managed=true']]));
+    $nets = docker_ok('GET', "/networks?filters=$filters", null, 'application/json', 30, $transport);
+    $fixed = 0;
+    foreach ($nets as $net) {
+        $owner = $net['Labels']['af.egress'] ?? null;
+        if ($owner !== $egress && !($owner === null && $egress === 'af-egress')) {
+            continue;
+        }
+        $detail = docker_ok('GET', '/networks/' . rawurlencode($net['Name']), null, 'application/json', 30, $transport);
+        $members = array_map(fn($c) => $c['Name'] ?? '', array_values($detail['Containers'] ?? []));
+        if (in_array($egress, $members, true)) {
+            continue;
+        }
+        [$code, $res] = docker('POST', '/networks/' . rawurlencode($net['Name']) . '/connect', ['Container' => $egress], 'application/json', 30, $transport);
+        if ($code >= 300 && !($code === 403 && stripos($res, 'already exists') !== false)) {
+            throw new RuntimeException('Could not re-attach egress to ' . $net['Name'] . ": HTTP $code");
+        }
+        $fixed++;
+    }
+    return $fixed;
+}
+
 // ---------------------------------------------------------------- manifest (strict schema)
 
 function validate_manifest(array $m, string $id): array
@@ -481,21 +515,153 @@ function hermes_config(array $m): string
     return implode("\n", $lines);
 }
 
+// ---------------------------------------------------------------- model provider credentials
+// Keys entered on the "Model providers" page are stored here (one file per provider, 0600),
+// next to the bot tokens. The .env values remain a fallback for existing setups.
+
+const PROVIDERS = ['anthropic', 'gemini', 'groq'];
+
+function provider_id(string $p): string
+{
+    if (!in_array($p, PROVIDERS, true)) {
+        fail(404, 'unknown provider');
+    }
+    return $p;
+}
+
+/** Detects the credential type from its format, or rejects it. */
+function provider_key_kind(string $provider, string $value): string
+{
+    return match (true) {
+        $provider === 'anthropic' && (bool)preg_match('/^sk-ant-oat\d*-[A-Za-z0-9_\-]{20,}$/', $value) => 'oauth',
+        $provider === 'anthropic' && (bool)preg_match('/^sk-ant-api\d*-[A-Za-z0-9_\-]{20,}$/', $value) => 'api_key',
+        $provider === 'gemini' && (bool)preg_match('/^AIza[A-Za-z0-9_\-]{30,}$/', $value) => 'api_key',
+        $provider === 'groq' && (bool)preg_match('/^gsk_[A-Za-z0-9]{20,}$/', $value) => 'api_key',
+        default => fail(422, match ($provider) {
+            'anthropic' => 'This does not look like a Claude API key (sk-ant-api…) or subscription token (sk-ant-oat…).',
+            'gemini' => 'This does not look like a Gemini API key (AIza…).',
+            default => 'This does not look like a Groq API key (gsk_…).',
+        }),
+    };
+}
+
+/** Asks the provider whether the credential is valid (listing models costs nothing). */
+function verify_provider_live(string $provider, string $kind, string $value): bool
+{
+    [$url, $headers] = match ($provider) {
+        'anthropic' => ['https://api.anthropic.com/v1/models?limit=1', array_merge(
+            ['anthropic-version: 2023-06-01'],
+            $kind === 'oauth' ? ["Authorization: Bearer $value", 'anthropic-beta: oauth-2025-04-20'] : ["x-api-key: $value"]
+        )],
+        'gemini' => ['https://generativelanguage.googleapis.com/v1beta/models?pageSize=1', ["x-goog-api-key: $value"]],
+        'groq' => ['https://api.groq.com/openai/v1/models', ["Authorization: Bearer $value"]],
+    };
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 15, CURLOPT_HTTPHEADER => $headers]);
+    $res = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    if ($res === false || $code === 0 || $code >= 500) {
+        fail(502, 'Could not reach the provider to verify the key. Try again.');
+    }
+    return $code === 200;
+}
+
+function provider_file(string $provider, string $secretsDir = SECRETS_DIR): string
+{
+    return "$secretsDir/provider_$provider.json";
+}
+
+/** Marker written when the owner removes a provider, so a .env fallback key is ignored too. */
+function provider_off_file(string $provider, string $secretsDir = SECRETS_DIR): string
+{
+    return "$secretsDir/provider_$provider.off";
+}
+
+/** @return array{kind: string, value: string, source: string}|null */
+function provider_credential(string $provider, string $secretsDir = SECRETS_DIR): ?array
+{
+    if (is_file(provider_off_file($provider, $secretsDir))) {
+        return null;
+    }
+    $raw = @file_get_contents(provider_file($provider, $secretsDir));
+    if ($raw !== false) {
+        $d = json_decode($raw, true);
+        if (is_array($d) && is_string($d['value'] ?? null) && is_string($d['kind'] ?? null)) {
+            return ['kind' => $d['kind'], 'value' => $d['value'], 'source' => 'page'];
+        }
+    }
+    $env = fn(string $k) => (string)(getenv($k) ?: '');
+    return match ($provider) {
+        'anthropic' => $env('ANTHROPIC_OAUTH_TOKEN') !== '' ? ['kind' => 'oauth', 'value' => $env('ANTHROPIC_OAUTH_TOKEN'), 'source' => 'env']
+            : ($env('ANTHROPIC_API_KEY') !== '' ? ['kind' => 'api_key', 'value' => $env('ANTHROPIC_API_KEY'), 'source' => 'env'] : null),
+        'gemini' => $env('GEMINI_API_KEY') !== '' ? ['kind' => 'api_key', 'value' => $env('GEMINI_API_KEY'), 'source' => 'env'] : null,
+        'groq' => $env('GROQ_API_KEY') !== '' ? ['kind' => 'api_key', 'value' => $env('GROQ_API_KEY'), 'source' => 'env'] : null,
+        default => null,
+    };
+}
+
+/** Status only: never returns a credential value. */
+function providers_status(string $secretsDir = SECRETS_DIR): array
+{
+    $out = [];
+    foreach (PROVIDERS as $p) {
+        $c = provider_credential($p, $secretsDir);
+        $out[] = ['id' => $p, 'configured' => $c !== null, 'source' => $c['source'] ?? null, 'kind' => $c['kind'] ?? null];
+    }
+    return $out;
+}
+
+/** @param callable(string, string, string): bool $verify */
+function store_provider_credential(string $provider, string $raw, callable $verify, string $secretsDir = SECRETS_DIR): void
+{
+    $value = trim($raw);
+    $kind = provider_key_kind($provider, $value);
+    if (!$verify($provider, $kind, $value)) {
+        fail(422, 'The provider rejected this key.');
+    }
+    $tmp = "$secretsDir/.provider_$provider.tmp." . bin2hex(random_bytes(4));
+    $payload = json_encode(['provider' => $provider, 'kind' => $kind, 'value' => $value]);
+    if ($payload === false || file_put_contents($tmp, $payload) === false) {
+        @unlink($tmp);
+        throw new RuntimeException('Failed to write provider credential');
+    }
+    if (!chmod($tmp, 0600) || !rename($tmp, provider_file($provider, $secretsDir))) {
+        @unlink($tmp);
+        throw new RuntimeException('Failed to finalize provider credential');
+    }
+    @unlink(provider_off_file($provider, $secretsDir));
+}
+
+/** Removes the page key and disables any .env fallback for this provider. */
+function delete_provider_credential(string $provider, string $secretsDir = SECRETS_DIR): void
+{
+    @unlink(provider_file($provider, $secretsDir));
+    if (file_put_contents(provider_off_file($provider, $secretsDir), '') === false) {
+        throw new RuntimeException('Failed to disable provider');
+    }
+}
+
+/** The env var each runtime reads for this provider and credential type. */
+function model_env(array $model, string $runtime, string $secretsDir = SECRETS_DIR): string
+{
+    $c = provider_credential($model['provider'], $secretsDir);
+    if ($c === null) {
+        fail(500, 'The selected model provider is not connected. Open Model providers and connect it.');
+    }
+    $var = match ($model['provider']) {
+        // OpenClaw reads ANTHROPIC_OAUTH_TOKEN, Hermes reads ANTHROPIC_TOKEN for a subscription token.
+        'anthropic' => $c['kind'] === 'oauth' ? ($runtime === 'hermes' ? 'ANTHROPIC_TOKEN' : 'ANTHROPIC_OAUTH_TOKEN') : 'ANTHROPIC_API_KEY',
+        'gemini' => 'GEMINI_API_KEY',
+        'groq' => 'GROQ_API_KEY',
+    };
+    return "$var={$c['value']}";
+}
+
 function runtime_spec(array $m, string $vname): array
 {
     $model = model_spec($m['model']);
-    $oauth = getenv('ANTHROPIC_OAUTH_TOKEN') ?: '';
-    $apiKey = getenv('ANTHROPIC_API_KEY') ?: '';
-    $geminiKey = getenv('GEMINI_API_KEY') ?: '';
-    $groqKey = getenv('GROQ_API_KEY') ?: '';
-    $modelEnv = match ($model['provider']) {
-        'anthropic' => $oauth !== '' ? "ANTHROPIC_TOKEN=$oauth" : ($apiKey !== '' ? "ANTHROPIC_API_KEY=$apiKey" : ''),
-        'gemini' => $geminiKey !== '' ? "GEMINI_API_KEY=$geminiKey" : '',
-        'groq' => $groqKey !== '' ? "GROQ_API_KEY=$groqKey" : '',
-    };
-    if ($modelEnv === '') {
-        fail(500, 'The selected model provider API key is not configured on the platform.');
-    }
+    $modelEnv = model_env($model, $m['runtime']);
     if ($m['runtime'] === 'hermes') {
         return [
             'image' => getenv('HERMES_IMAGE'), 'uid' => 10000, 'dir' => '/opt/data',

@@ -57,6 +57,19 @@ $route = function (string $verb, string $p) use ($method, $path, &$m): bool {
 
 if ($route('GET', '/health')) {
     docker_ok('GET', '/_ping');
+    // Self-heal agent egress links at most every 30 s (the compose healthcheck calls this every 5 s).
+    $stamp = sys_get_temp_dir() . '/af-egress-check';
+    if (!is_file($stamp) || time() - (int)@filemtime($stamp) >= 30) {
+        @touch($stamp);
+        try {
+            $fixed = ensure_egress_links();
+            if ($fixed > 0) {
+                logline("re-attached egress to $fixed agent network(s)");
+            }
+        } catch (Throwable $e) {
+            logline('egress self-heal failed: ' . get_class($e));
+        }
+    }
     out(['ok' => true]);
 }
 
@@ -68,6 +81,28 @@ if ($route('POST', '/secrets')) {
     $res = store_telegram_secret($b['value'], 'verify_telegram_token_live');
     logline("stored secret {$res['secret_ref']} for telegram bot {$res['account']}");
     out($res);
+}
+
+if ($route('GET', '/providers')) {
+    out(providers_status());
+}
+
+if ($route('PUT', '/providers/([a-z]+)')) {
+    $p = provider_id($m[1]);
+    $b = body();
+    if (!is_string($b['value'] ?? null) || strlen($b['value']) > 400) {
+        fail(422, 'invalid key');
+    }
+    store_provider_credential($p, $b['value'], 'verify_provider_live');
+    logline("provider $p connected from the page");
+    out(providers_status());
+}
+
+if ($route('DELETE', '/providers/([a-z]+)')) {
+    $p = provider_id($m[1]);
+    delete_provider_credential($p);
+    logline("provider $p disconnected from the page");
+    out(providers_status());
 }
 
 if ($route('DELETE', '/secrets/(sec_[a-f0-9]{32})')) {
@@ -95,7 +130,7 @@ if ($route('POST', '/agents/([0-9a-f-]+)/create')) {
             [$repo, $digest] = explode('@', $image);
             docker_ok('POST', '/images/create?' . http_build_query(['fromImage' => strtok($repo, ':'), 'tag' => $digest]), null, 'application/json', 600);
         }
-        docker_ok('POST', '/networks/create', ['Name' => $nname, 'Driver' => 'bridge', 'Internal' => true, 'Labels' => $labels]);
+        docker_ok('POST', '/networks/create', ['Name' => $nname, 'Driver' => 'bridge', 'Internal' => true, 'Labels' => $labels + ['af.egress' => $egress]]);
         docker_ok('POST', "/networks/$nname/connect", ['Container' => $egress]);
         docker_ok('POST', '/volumes/create', ['Name' => $vname, 'Labels' => $labels]);
         $proxy = "http://$egress:8888";

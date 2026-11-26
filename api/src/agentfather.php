@@ -25,6 +25,22 @@ const AF_MODELS = [
     'Gemini 3.8 Flash' => 'gemini-3-8-flash',
     'Groq GPT OSS 120B' => 'groq-gpt-oss-120b',
 ];
+const AF_MODEL_PROVIDER = [
+    'claude-sonnet-5-5' => 'anthropic', 'claude-opus-5-5' => 'anthropic', 'claude-haiku-5-5' => 'anthropic',
+    'claude-sonnet-4-6' => 'anthropic', 'gemini-3-8-flash' => 'gemini', 'groq-gpt-oss-120b' => 'groq',
+];
+
+/**
+ * Models AgentFather may offer: only those whose provider is connected on the "Model providers" page.
+ * $GLOBALS['af_enabled_providers'] is set by the API per request; unset (tests/CLI) means "all".
+ */
+function af_models(): array
+{
+    $enabled = $GLOBALS['af_enabled_providers'] ?? null;
+    if ($enabled === null) return AF_MODELS;
+    return array_filter(AF_MODELS, fn($id) => in_array(AF_MODEL_PROVIDER[$id], $enabled, true));
+}
+
 const AF_ACCESS_ANYONE = 'Anyone with the QR code or link';
 const AF_ACCESS_LIST = 'Only people I list';
 const CHANGE_Q = '__change';
@@ -99,7 +115,7 @@ function af_questions(): array
         'model' => [
             'label' => 'Model', 'kind' => 'single', 'other' => false,
             'text' => 'Which AI model should it use?',
-            'options' => array_keys(AF_MODELS),
+            'options' => array_keys(af_models()),
         ],
         'channel' => [
             'label' => 'Channel', 'kind' => 'single', 'other' => false,

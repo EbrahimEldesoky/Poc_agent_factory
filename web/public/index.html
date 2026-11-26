@@ -11,11 +11,15 @@
 <div class="shell">
   <aside class="sidebar">
     <div class="brand"><span class="logo">AF</span> Agent Factory</div>
-    <nav><a class="active" href="/">Agents</a></nav>
+    <nav>
+      <a class="active" href="/" id="nav-agents"><span class="nav-ico">◉</span> Agents</a>
+      <a href="#providers" id="nav-providers"><span class="nav-ico">✦</span> Model providers</a>
+    </nav>
     <div class="sidebar-foot"><span id="me"></span><button class="link" id="logout">Sign out</button></div>
   </aside>
   <main class="main" id="main">
     <section class="content">
+      <div id="view-agents">
       <header class="page-head">
         <h1>Agents</h1>
         <button class="btn primary" id="create">Create agent</button>
@@ -26,6 +30,17 @@
           <tbody id="rows"></tbody>
         </table>
         <p class="empty" id="empty" hidden>No agents yet. Click Create agent to talk to AgentFather.</p>
+      </div>
+      </div>
+      <div id="view-providers" hidden>
+        <header class="page-head">
+          <div><h1>Model providers</h1>
+            <p class="page-sub">Add the AI providers your agents can use. Only their models are offered when you create an agent.</p></div>
+          <button class="btn primary" id="prov-create" hidden>Create agent</button>
+        </header>
+        <p class="prov-notice" id="prov-notice" hidden></p>
+        <div class="prov-grid" id="prov-grid"></div>
+        <p class="muted small prov-foot">Keys go straight to the deployment broker's secrets store and are checked with the provider. They are never stored in the database or shown again.</p>
       </div>
     </section>
     <aside class="side" id="side" hidden>

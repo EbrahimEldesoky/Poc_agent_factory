@@ -226,6 +226,10 @@ function confirm_agent_session(string $sid, array $u, array $body): array
         if (!$cfg) {
             api_fail(422, 'Configuration rejected by the platform: ' . ($err ?? 'incomplete'));
         }
+        $enabled = $GLOBALS['af_enabled_providers'] ?? null;
+        if ($enabled !== null && !in_array(AF_MODEL_PROVIDER[$cfg['model']], $enabled, true)) {
+            api_fail(422, 'The model provider for this agent is not connected. Open Model providers, or click Change and pick another model.');
+        }
         if ($cfg['channel_type'] === 'whatsapp') {
             api_fail(422, 'WhatsApp is not available in this POC yet. Click Change and choose Telegram.');
         }
