@@ -364,6 +364,38 @@ test('Docker cleanup failure throws instead of reporting success', function () {
     });
 });
 
+test('broker re-attaches egress only to its own agent networks', function () {
+    $connected = [];
+    $transport = function (string $method, string $path, mixed $body = null) use (&$connected): array {
+        if ($method === 'GET' && str_starts_with($path, '/networks?')) {
+            return [200, json_encode([
+                ['Name' => 'af-net-a', 'Labels' => ['af.managed' => 'true', 'af.egress' => 'af-egress']],
+                ['Name' => 'af-net-b', 'Labels' => ['af.managed' => 'true']],                          // legacy, unlabelled
+                ['Name' => 'af-net-c', 'Labels' => ['af.managed' => 'true', 'af.egress' => 'af-egress']],
+                ['Name' => 'af-net-other', 'Labels' => ['af.managed' => 'true', 'af.egress' => 'af-egress-ci']],
+            ])];
+        }
+        if ($method === 'GET' && str_starts_with($path, '/networks/')) {
+            $members = $path === '/networks/af-net-c' ? ['x' => ['Name' => 'af-egress']] : ['y' => ['Name' => 'af-agent-1']];
+            return [200, json_encode(['Containers' => $members])];
+        }
+        if ($method === 'POST' && str_ends_with($path, '/connect')) {
+            $connected[] = $path;
+            return [200, ''];
+        }
+        return [404, '{}'];
+    };
+    assert_eq(2, ensure_egress_links($transport, 'af-egress'), 'networks fixed');
+    assert_eq(['/networks/af-net-a/connect', '/networks/af-net-b/connect'], $connected);
+
+    // Docker failure on connect is reported, not swallowed
+    assert_throws(RuntimeException::class, fn() => ensure_egress_links(function (string $m, string $p) {
+        if ($m === 'GET' && str_starts_with($p, '/networks?')) return [200, json_encode([['Name' => 'af-net-a', 'Labels' => ['af.egress' => 'af-egress']]])];
+        if ($m === 'GET') return [200, json_encode(['Containers' => []])];
+        return [500, '{"message":"boom"}'];
+    }, 'af-egress'));
+});
+
 test('worker restart recovery re-queues interrupted running jobs without failing agents', function () {
     $aid = '11111111-1111-4111-8111-111111111111';
     $jid = '22222222-2222-4222-8222-222222222222';

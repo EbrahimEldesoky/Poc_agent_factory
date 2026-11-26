@@ -6,7 +6,10 @@ COPY tsconfig.json .
 COPY src ./src
 RUN npx tsc -p tsconfig.json && cp node_modules/qrcode-generator/qrcode.js dist/qrcode.js
 
-FROM nginx:1.27.3-alpine
+# Unprivileged nginx: runs as uid 101 and listens on 8080, so the web container never needs root.
+FROM nginxinc/nginx-unprivileged:1.27.3-alpine
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY public /usr/share/nginx/html
 COPY --from=build /src/dist/ /usr/share/nginx/html/
+USER 101
+EXPOSE 8080
