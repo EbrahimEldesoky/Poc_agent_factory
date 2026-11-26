@@ -163,3 +163,32 @@ egress/   tinyproxy allowlist
 web/      src/app.ts, src/login.ts (TypeScript) + public/{index.html, login.html, styles.css} + nginx.conf
 docs/openclaw-notes.md
 ```
+
+## CI
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| `ci.yml` | push / PR to `main` | **Checks**: PHP lint, unit + contract tests (`tests/run.php`), strict TypeScript, shellcheck, compose validation. **Security**: gitleaks (full history), hadolint, Trivy config + dependency scan, `npm audit`. **Build**: the 4 images with layer cache, each scanned by Trivy. **Integration**: boots the real stack with throwaway secrets and runs `tests/integration/smoke.sh` (auth, CSRF/CORS, model providers, AgentFather, confirm through the broker to Telegram, Docker-socket isolation, egress allowlist, no secret in logs or DB). |
+| `e2e.yml` | nightly + manual | Full agent lifecycle with a real bot and model key (`tests/e2e/agent-lifecycle.sh`): create → Active → hardening checks → Off → On → Delete → nothing left. Needs secrets `E2E_TELEGRAM_BOT_TOKEN` (a bot used only by CI) and `E2E_ANTHROPIC_API_KEY`; skipped otherwise. |
+
+**Run the checks locally**
+
+```bash
+php tests/run.php                                   # unit + contract (or: docker run --rm -v "$PWD":/app -w /app php:8.3-cli php tests/run.php)
+tests/integration/gen-env.sh /tmp/ci.env            # throwaway secrets, port 3999, egress "af-egress-ci"
+docker compose -p afci --env-file /tmp/ci.env up -d --build --wait
+tests/integration/smoke.sh afci /tmp/ci.env
+docker compose -p afci --env-file /tmp/ci.env down -v
+```
+
+The test stack is isolated (own project, port and egress), so it can run next to a live stack.
+
+**Rebuilds keep agents online**: recreating the `egress` container (e.g. `docker compose up --build`) used
+to cut running agents off their network. The broker now re-attaches egress to every agent network on its
+healthcheck (≤ 30 s).
+
+**No deployment pipeline yet**: the project runs locally only. CI checks every push; there is no CD stage
+until a production environment exists.
+
+Reviewed exceptions: `.gitleaksignore` (two fake values in test fixtures) and `.trivyignore.yaml`
+(the broker runs as root because it must open the Docker socket).

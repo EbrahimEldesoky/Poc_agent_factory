@@ -1,0 +1,9 @@
+# Reviewed exceptions for `trivy config`. Keep each one scoped to a single file with a reason.
+misconfigurations:
+  - id: AVD-DS-0002
+    paths:
+      - "broker/Dockerfile"
+    statement: >-
+      The deployment broker must open the root-owned Docker socket; it is the only service allowed to.
+      Its API is token-authenticated, validates every request against the agent manifest, and agent
+      containers it creates run non-root with all capabilities dropped.

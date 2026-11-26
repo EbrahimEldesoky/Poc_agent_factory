@@ -1,0 +1,3 @@
+# Test fixtures in tests/run.php (fake hex values used to check config validation). Not real secrets.
+c573fab71d831bef799009b59e0cde71a99a588c:tests/run.php:generic-api-key:94
+c573fab71d831bef799009b59e0cde71a99a588c:tests/run.php:generic-api-key:95

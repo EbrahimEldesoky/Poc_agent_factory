@@ -1,0 +1,76 @@
+name: E2E agent lifecycle
+
+# Real agents with a real Telegram bot and model key. Runs nightly and on demand, not on every PR,
+# because it pulls the OpenClaw/Hermes images (several GB) and uses paid model calls.
+# Required repository secrets (the job is skipped with a notice when they are missing):
+#   E2E_TELEGRAM_BOT_TOKEN  a bot dedicated to CI (Telegram allows one poller per bot)
+#   E2E_ANTHROPIC_API_KEY   an Anthropic API key
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      runtime:
+        description: Runtime to test
+        type: choice
+        options: [openclaw, hermes]
+        default: openclaw
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e # one test bot, one poller at a time
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PROJECT: afe2e
+      ENV_FILE: /tmp/afe2e.env
+      E2E_TELEGRAM_BOT_TOKEN: ${{ secrets.E2E_TELEGRAM_BOT_TOKEN }}
+      E2E_ANTHROPIC_API_KEY: ${{ secrets.E2E_ANTHROPIC_API_KEY }}
+      RUNTIME: ${{ inputs.runtime || 'openclaw' }}
+    steps:
+      - name: Check secrets
+        id: gate
+        run: |
+          if [ -z "$E2E_TELEGRAM_BOT_TOKEN" ] || [ -z "$E2E_ANTHROPIC_API_KEY" ]; then
+            echo "::notice::E2E skipped: set E2E_TELEGRAM_BOT_TOKEN and E2E_ANTHROPIC_API_KEY repository secrets to enable it."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - name: Generate env with the real model key
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          tests/integration/gen-env.sh "$ENV_FILE"
+          sed -i "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=$E2E_ANTHROPIC_API_KEY|" "$ENV_FILE"
+
+      - name: Start the stack
+        if: steps.gate.outputs.run == 'true'
+        run: docker compose -p "$PROJECT" --env-file "$ENV_FILE" up -d --build --wait --wait-timeout 300
+
+      - name: Agent lifecycle (${{ env.RUNTIME }})
+        if: steps.gate.outputs.run == 'true'
+        run: tests/e2e/agent-lifecycle.sh "$PROJECT" "$ENV_FILE" "$RUNTIME"
+
+      - name: Logs on failure
+        if: failure() && steps.gate.outputs.run == 'true'
+        run: |
+          docker compose -p "$PROJECT" --env-file "$ENV_FILE" logs --no-color --tail 200
+          for c in $(docker ps -aq --filter label=af.managed=true); do docker logs --tail 100 "$c"; done
+
+      - name: Tear down (stack and any agent left behind)
+        if: always() && steps.gate.outputs.run == 'true'
+        run: |
+          docker ps -aq --filter label=af.managed=true | xargs -r docker rm -f
+          docker network ls -q --filter label=af.managed=true | xargs -r docker network rm
+          docker volume ls -q --filter label=af.managed=true | xargs -r docker volume rm
+          docker compose -p "$PROJECT" --env-file "$ENV_FILE" down -v --remove-orphans
