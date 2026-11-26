@@ -8,10 +8,32 @@ isolated [OpenClaw](https://docs.openclaw.ai) container, reach it on Telegram, a
 Requirements: Docker (with Compose). Nothing else on the host.
 
 ```bash
-cp .env.example .env      # fill the selected provider key plus BROKER_TOKEN and SESSION_SECRET
+cp .env.example .env      # fill BROKER_TOKEN, SESSION_SECRET, POSTGRES_PASSWORD, OWNER_PASSWORD, and a provider key
 docker compose up -d --build
-open http://localhost:3000   # sign in: owner@acme.test / changeme (from .env)
+open http://localhost:3000   # sign in with OWNER_EMAIL / OWNER_PASSWORD from .env
 ```
+
+### Smoke test and checks
+
+Run daemon-free checks locally:
+
+```bash
+find api broker tests -name '*.php' -print0 | xargs -0 -n1 php -l
+php tests/run.php
+cd web && npm ci && npx tsc -p tsconfig.json --noEmit && cd ..
+docker compose config -q
+```
+
+Smoke test with Docker Compose (requires a populated `.env` with non-default secrets):
+
+```bash
+docker compose up -d --build
+docker compose ps          # wait until db, broker, api, web, and egress report healthy
+curl -fsS http://localhost:${WEB_PORT:-3000}/login >/dev/null
+curl -fsS http://localhost:${WEB_PORT:-3000}/api/health
+```
+
+Note on lockfiles: `web/package-lock.json` pins the TypeScript and `qrcode-generator` dependencies. `composer.lock` is absent because the PHP services use zero third-party Composer packages (only standard PHP 8.3 extensions and `pdo_pgsql`).
 
 The first agent start pulls the pinned OpenClaw image (~1 GB) if it is not already present:
 `docker pull ghcr.io/openclaw/openclaw:2026.11.2`.
@@ -51,7 +73,7 @@ Browser ──► web (nginx + TypeScript page) ──► api (PHP + AgentFather
            af-agent-<id> (OpenClaw 2026.11.2, own volume, own internal network, 1 vCPU / 2 GB)
                                               │ HTTPS_PROXY
                                               ▼
-                     af-egress (tinyproxy allowlist: api.anthropic.com, api.telegram.org) ──► Internet
+                     af-egress (tinyproxy allowlist: api.anthropic.com, generativelanguage.googleapis.com, api.groq.com, api.telegram.org) ──► Internet
 ```
 
 | Service | Role | Docker socket | Secrets |
@@ -59,7 +81,7 @@ Browser ──► web (nginx + TypeScript page) ──► api (PHP + AgentFather
 | `web` | nginx serving the page + sign-in (TypeScript, compiled by `tsc` in the image); talks only to `/api` | no | no |
 | `api` | PHP 8.3: auth, AgentFather questionnaire, config validation, enqueues jobs | no | no |
 | `worker` | PHP CLI loop: runs jobs (Postgres `FOR UPDATE SKIP LOCKED`), reconciles states, records events | no | no |
-| `db` | Postgres: `users`, `agents`, `agentfather_sessions`, `jobs`, `events` | no | no |
+| `db` | Postgres: `users`, `agents`, `agentfather_sessions`, `jobs`, `events`, `login_attempts` | no | no |
 | `broker` | PHP 8.3: validates the agent manifest, drives the Docker Engine API over the unix socket, secrets store | **yes** | model key + bot tokens |
 | `egress` | Forward proxy, default deny, provider API hosts and Telegram allowed | no | no |
 
@@ -88,7 +110,7 @@ Browser ──► web (nginx + TypeScript page) ──► api (PHP + AgentFather
 | Default deny | `tools: { profile: "minimal", deny: ["*"] }`. Egress: internal network + allowlist proxy restricted to supported model API hosts and Telegram |
 | Permissions outside the model | No tools at all, so the agent cannot *do* anything beyond chatting. Prohibited tasks are also written as "Red Lines" in `AGENTS.md`. |
 | Secrets never appear | Token only in the broker's secrets volume (0600) and the agent's env. API redacts token/key patterns from chat; validation errors never echo input; access logs off. |
-| Pinned versions | OpenClaw tag + digest; all base images pinned. |
+| Pinned versions | OpenClaw and Hermes images pinned by tag + digest; base images pinned by exact version tag; npm deps pinned in `web/package-lock.json`. |
 | Activity from real events | `events` table written by the worker; `last_message_at` comes from the newest session-transcript write inside the agent volume (read by the broker). |
 | Safe failure / no duplicate | Broker `create` removes leftovers first; Docker names are unique; one in-flight job per agent enforced by a unique index. |
 | One channel identity per agent | One bot token per agent; reuse refused by hash. |
@@ -123,13 +145,11 @@ Browser ──► web (nginx + TypeScript page) ──► api (PHP + AgentFather
   @BotFather (QR code provided) and pastes the token. People reach the agent by scanning its QR code.
 - **Secrets store** is a Docker volume owned by the broker, not a vault. Tokens are passed to agent
   containers as env vars, so `docker inspect` on the host shows them (host admins only).
-- **Telegram access** is `dmPolicy: "open"`: anyone who finds the bot can chat. An allowlist of
-  Telegram user ids is the obvious next field for AgentFather to ask.
+- **Telegram access** supports both `dmPolicy: "open"` (anyone with the link/QR) and `dmPolicy: "allowlist"` (only listed numeric Telegram user IDs, enforced via `allowFrom` / `TELEGRAM_ALLOWED_USERS`).
 - **Prohibited tasks** for a tools-less chat agent are enforced by the instructions; the hard guarantee
   is that the agent has no tools and no network beyond the model and Telegram.
-- **Job queue** is a single worker process. Jobs left `running` by a worker crash are marked failed at
-  startup; the owner retries with the switch (which re-runs `create` and removes any leftover container).
-- **Auth**: one seeded owner, HMAC-signed cookie, `password_hash()` (bcrypt). No sign-up, no roles.
+- **Job queue** is a single worker process with leased jobs (`lease_expires_at`). Interrupted `running` jobs are automatically re-queued on worker startup or lease expiry without failing the agent.
+- **Auth**: one seeded owner, HMAC-signed cookie (`HttpOnly`, `SameSite=Strict`, `Secure` on HTTPS), `password_hash()` (bcrypt), CSRF token (`X-CSRF-Token`), and DB-backed login rate limiting. No sign-up, no roles.
 - **Egress proxy** filters by hostname (CONNECT), not by IP.
 
 ## Layout

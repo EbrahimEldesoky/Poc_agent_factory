@@ -28,22 +28,48 @@ CREATE TABLE IF NOT EXISTS events (
   id bigserial PRIMARY KEY, tenant_id uuid NOT NULL, agent_id uuid, job_id uuid,
   timestamp timestamptz NOT NULL DEFAULT now(), type text NOT NULL, channel text,
   input_summary text, state text, result text, duration_ms integer);
+CREATE TABLE IF NOT EXISTS login_attempts (
+  email text NOT NULL,
+  ip text NOT NULL,
+  failures integer NOT NULL DEFAULT 0,
+  locked_until timestamptz,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (email, ip)
+);
 -- Added after the brief's 5-table model: runtime choice, model choice, Telegram allowlist.
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS runtime text NOT NULL DEFAULT 'openclaw' CHECK (runtime IN ('openclaw','hermes'));
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS model text NOT NULL DEFAULT 'claude-sonnet-4-6';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS allowed_users jsonb NOT NULL DEFAULT '[]';
+-- Job lease for worker restart recovery.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
 -- At most one in-flight job per agent: the DB enforces it, not the UI.
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_job_per_agent ON jobs(agent_id)
   WHERE state IN ('queued','running','rolling_back');
 SQL;
 
-function pdo(): PDO
+/** @internal Allows tests to inject a mock/fake PDO instance. */
+function set_pdo(?PDO $custom): void
+{
+    pdo($custom, true);
+}
+
+function pdo(?PDO $override = null, bool $replace = false): PDO
 {
     static $pdo = null;
+    if ($replace) {
+        $pdo = $override;
+        if ($pdo === null) {
+            return new PDO('sqlite::memory:');
+        }
+        return $pdo;
+    }
     if ($pdo === null) {
-        $u = parse_url(getenv('DATABASE_URL'));
+        $u = parse_url((string)getenv('DATABASE_URL'));
+        if (!is_array($u) || empty($u['host']) || empty($u['path'])) {
+            throw new RuntimeException('Invalid DATABASE_URL');
+        }
         $dsn = sprintf('pgsql:host=%s;port=%d;dbname=%s', $u['host'], $u['port'] ?? 5432, ltrim($u['path'], '/'));
-        $pdo = new PDO($dsn, $u['user'], $u['pass'], [
+        $pdo = new PDO($dsn, $u['user'] ?? '', $u['pass'] ?? '', [
             PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         ]);
@@ -81,19 +107,49 @@ function is_uuid(string $s): bool
 function db_init(): void
 {
     for ($i = 0; $i < 30; $i++) {
-        try { pdo(); break; } catch (PDOException) { sleep(1); }
+        try {
+            pdo();
+            break;
+        } catch (PDOException) {
+            sleep(1);
+        }
     }
     pdo()->exec(SCHEMA);
     $email = strtolower(getenv('OWNER_EMAIL') ?: 'owner@acme.test');
+    $password = getenv('OWNER_PASSWORD');
+    if (!is_string($password) || $password === '') {
+        throw new RuntimeException('OWNER_PASSWORD must be configured');
+    }
     if (!q1('SELECT 1 FROM users WHERE email=?', $email)) {
-        q("INSERT INTO users(id, tenant_id, email, password_hash, role) VALUES (?,?,?,?,'owner') ON CONFLICT DO NOTHING",
-          uuid4(), uuid4(), $email, password_hash(getenv('OWNER_PASSWORD') ?: 'changeme', PASSWORD_DEFAULT));
+        q(
+            "INSERT INTO users(id, tenant_id, email, password_hash, role) VALUES (?,?,?,?,'owner') ON CONFLICT DO NOTHING",
+            uuid4(),
+            uuid4(),
+            $email,
+            password_hash($password, PASSWORD_DEFAULT)
+        );
     }
 }
 
-function event(string $tenant, ?string $agent, string $type, ?string $state = null, ?string $result = null,
-               ?string $job = null, ?int $ms = null, ?string $channel = null): void
-{
-    q('INSERT INTO events(tenant_id, agent_id, job_id, type, channel, state, result, duration_ms) VALUES (?,?,?,?,?,?,?,?)',
-      $tenant, $agent, $job, $type, $channel, $state, $result, $ms);
+function event(
+    string $tenant,
+    ?string $agent,
+    string $type,
+    ?string $state = null,
+    ?string $result = null,
+    ?string $job = null,
+    ?int $ms = null,
+    ?string $channel = null
+): void {
+    q(
+        'INSERT INTO events(tenant_id, agent_id, job_id, type, channel, state, result, duration_ms) VALUES (?,?,?,?,?,?,?,?)',
+        $tenant,
+        $agent,
+        $job,
+        $type,
+        $channel,
+        $state,
+        $result,
+        $ms
+    );
 }

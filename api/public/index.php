@@ -4,13 +4,13 @@ ini_set('display_errors', '0');
 ini_set('log_errors', '1');
 /* Agent Factory API. The web app talks only to this. No Docker socket, no secrets store. */
 
+require_once __DIR__ . '/../src/config.php';
 require_once __DIR__ . '/../src/db.php';
 require_once __DIR__ . '/../src/jobs.php';
 require_once __DIR__ . '/../src/agentfather.php';
+require_once __DIR__ . '/../src/security.php';
 
 const COOKIE = 'af_session';
-
-final class HttpError extends RuntimeException {}
 
 function json_out(mixed $data, int $code = 200): never
 {
@@ -29,15 +29,21 @@ function fail(int $code, string $detail): never
 function body(): array
 {
     $d = json_decode(file_get_contents('php://input') ?: '', true);
-    if (!is_array($d)) fail(422, 'Invalid request: body must be a JSON object');
+    if (!is_array($d)) {
+        fail(422, 'Invalid request: body must be a JSON object');
+    }
     return $d;
 }
 
 set_exception_handler(function (Throwable $e) {
-    if ($e instanceof HttpError) json_out(['detail' => $e->getMessage()], $e->getCode());
+    if ($e instanceof HttpError) {
+        json_out(['detail' => $e->getMessage()], $e->getCode());
+    }
     error_log('api error: ' . get_class($e) . ' at ' . basename($e->getFile()) . ':' . $e->getLine());
     json_out(['detail' => 'Internal error'], 500);
 });
+
+assert_api_config(true);
 
 // Schema + seeded owner, once per container.
 if (!file_exists('/tmp/.af-init')) {
@@ -48,55 +54,51 @@ if (!file_exists('/tmp/.af-init')) {
 // ---------------------------------------------------------------- auth
 function sign(string $payload): string
 {
-    $mac = hash_hmac('sha256', $payload, getenv('SESSION_SECRET'));
+    $secret = (string)getenv('SESSION_SECRET');
+    $mac = hash_hmac('sha256', $payload, $secret);
     return rtrim(strtr(base64_encode("$payload|$mac"), '+/', '-_'), '=');
 }
 
 function current_user(): array
 {
+    $secret = (string)getenv('SESSION_SECRET');
     $raw = base64_decode(strtr($_COOKIE[COOKIE] ?? '', '-_', '+/'), true) ?: '';
     $parts = explode('|', $raw);
-    if (count($parts) !== 2) fail(401, 'Not signed in');
+    if (count($parts) !== 2) {
+        fail(401, 'Not signed in');
+    }
     [$payload, $mac] = $parts;
-    if (!hash_equals(hash_hmac('sha256', $payload, getenv('SESSION_SECRET')), $mac)) fail(401, 'Not signed in');
-    [$uid, $exp] = explode(':', $payload) + [1 => '0'];
-    if ((int)$exp < time() || !is_uuid($uid)) fail(401, 'Not signed in');
-    return q1('SELECT id, tenant_id, email, role FROM users WHERE id=?', $uid) ?? fail(401, 'Not signed in');
+    if (!hash_equals(hash_hmac('sha256', $payload, $secret), $mac)) {
+        fail(401, 'Not signed in');
+    }
+    [$uid, $expStr] = explode(':', $payload) + [1 => '0'];
+    $exp = (int)$expStr;
+    if ($exp < time() || !is_uuid($uid)) {
+        fail(401, 'Not signed in');
+    }
+    $u = q1('SELECT id, tenant_id, email, role FROM users WHERE id=?', $uid);
+    if (!$u) {
+        fail(401, 'Not signed in');
+    }
+    $u['csrf_token'] = csrf_token_for_session($uid, $exp, $secret);
+    return $u;
 }
 
 // ---------------------------------------------------------------- helpers
-function public_agent(array $a, ?array $job = null): array
-{
-    $acct = $a['channel_account'] ?? '';
-    if ($a['channel_type'] === 'whatsapp' && strlen($acct) > 6) {
-        $acct = substr($acct, 0, 4) . str_repeat('•', strlen($acct) - 6) . substr($acct, -2);
-    }
-    $iso = fn(?string $t) => $t ? (new DateTimeImmutable($t))->format(DATE_ATOM) : null;
-    return [
-        'id' => $a['id'], 'name' => $a['name'], 'job' => $a['job'], 'channel_type' => $a['channel_type'],
-        'channel_account' => $acct, 'enabled' => (bool)$a['enabled'], 'state' => $a['state'],
-        'runtime' => $a['runtime'], 'model' => $a['model'], 'restricted' => json_decode($a['allowed_users'], true) !== [],
-        'state_reason' => $a['state_reason'], 'last_message_at' => $iso($a['last_message_at']),
-        'created_at' => $iso($a['created_at']), 'busy' => $job !== null,
-        'pending_job' => $job ? ['type' => $job['type'], 'state' => $job['state'], 'step' => $job['current_step']] : null,
-    ];
-}
-
-function active_job(string $agentId): ?array
-{
-    return q1("SELECT * FROM jobs WHERE agent_id=? AND state IN ('queued','running','rolling_back') LIMIT 1", $agentId);
-}
-
 function get_agent(string $id, array $u): array
 {
-    if (!is_uuid($id)) fail(404, 'Agent not found');
+    if (!is_uuid($id)) {
+        fail(404, 'Agent not found');
+    }
     return q1("SELECT * FROM agents WHERE id=? AND tenant_id=? AND state <> 'deleted'", $id, $u['tenant_id'])
         ?? fail(404, 'Agent not found');
 }
 
 function get_session(string $sid, array $u): array
 {
-    if (!is_uuid($sid)) fail(404, 'Session not found');
+    if (!is_uuid($sid)) {
+        fail(404, 'Session not found');
+    }
     $s = q1('SELECT * FROM agentfather_sessions WHERE id=? AND tenant_id=? AND user_id=?', $sid, $u['tenant_id'], $u['id'])
         ?? fail(404, 'Session not found');
     $s['messages'] = json_decode($s['messages'], true);
@@ -109,68 +111,129 @@ function session_out(array $s, ?string $error = null): array
     $state = $s['draft_config'] ?? ['answers' => [], 'asking' => af_next([])];
     $asking = array_key_exists('asking', $state) ? $state['asking'] : af_next($state['answers'] ?? []);
     $cfg = $err = null;
-    if ($asking === null) [$cfg, $err] = validate_config(af_build_config($state['answers'] ?? []));
-    return ['id' => $s['id'], 'messages' => $s['messages'], 'status' => $s['status'],
-            'question' => af_question($asking), 'complete' => $asking === null && $cfg !== null,
-            'config' => $cfg, 'validation_error' => $err, 'error' => $error];
+    if ($asking === null) {
+        [$cfg, $err] = validate_config(af_build_config($state['answers'] ?? []));
+    }
+    return [
+        'id' => $s['id'],
+        'messages' => $s['messages'],
+        'status' => $s['status'],
+        'question' => af_question($asking),
+        'complete' => $asking === null && $cfg !== null,
+        'config' => $cfg,
+        'validation_error' => $err,
+        'error' => $error,
+    ];
 }
 
-// ---------------------------------------------------------------- routes
-$method = $_SERVER['REQUEST_METHOD'];
-$path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+// ---------------------------------------------------------------- CORS + routes
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+$path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+$corsHeaders = evaluate_cors(
+    $method,
+    $_SERVER['HTTP_ORIGIN'] ?? null,
+    $_SERVER['HTTP_HOST'] ?? null,
+    (string)(getenv('CORS_ALLOWED_ORIGINS') ?: '')
+);
+foreach ($corsHeaders as $k => $v) {
+    header("$k: $v");
+}
+if ($method === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
+
 $m = [];
 $route = function (string $verb, string $pattern) use ($method, $path, &$m): bool {
     return $method === $verb && (bool)preg_match("#^$pattern$#", $path, $m);
 };
 
+if ($route('GET', '/api/health')) {
+    q1('SELECT 1');
+    json_out(['ok' => true]);
+}
+
+$secureCookie = is_https_request();
+
 if ($route('POST', '/api/login')) {
     $b = body();
-    $u = q1('SELECT * FROM users WHERE email=?', strtolower(trim((string)($b['email'] ?? ''))));
-    if (!$u || !password_verify((string)($b['password'] ?? ''), $u['password_hash'])) fail(401, 'Wrong email or password');
-    setcookie(COOKIE, sign($u['id'] . ':' . (time() + 12 * 3600)),
-              ['expires' => time() + 12 * 3600, 'path' => '/', 'httponly' => true, 'samesite' => 'Strict']);
-    json_out(['email' => $u['email']]);
+    $email = strtolower(trim((string)($b['email'] ?? '')));
+    $ip = client_ip();
+    check_login_rate_limit($email, $ip);
+    $u = q1('SELECT * FROM users WHERE email=?', $email);
+    if (!$u || !password_verify((string)($b['password'] ?? ''), $u['password_hash'])) {
+        record_login_failure($email, $ip);
+        fail(401, 'Wrong email or password');
+    }
+    clear_login_failures($email, $ip);
+    $exp = time() + 12 * 3600;
+    setcookie(COOKIE, sign($u['id'] . ':' . $exp), cookie_options($exp, $secureCookie));
+    json_out([
+        'email' => $u['email'],
+        'csrf_token' => csrf_token_for_session($u['id'], $exp, (string)getenv('SESSION_SECRET')),
+    ]);
 }
 
 if ($route('POST', '/api/logout')) {
-    setcookie(COOKIE, '', ['expires' => 1, 'path' => '/']);
+    setcookie(COOKIE, '', cookie_options(1, $secureCookie));
     json_out(['ok' => true]);
 }
 
 $u = current_user();
 
-if ($route('GET', '/api/me')) json_out(['email' => $u['email'], 'role' => $u['role']]);
+if (!in_array($method, ['GET', 'HEAD', 'OPTIONS'], true)) {
+    if (!verify_csrf_token($u['csrf_token'], $_SERVER['HTTP_X_CSRF_TOKEN'] ?? null)) {
+        fail(403, 'Invalid or missing CSRF token');
+    }
+}
+
+if ($route('GET', '/api/me')) {
+    json_out(['email' => $u['email'], 'role' => $u['role'], 'csrf_token' => $u['csrf_token']]);
+}
 
 if ($route('GET', '/api/agents')) {
     $rows = q("SELECT * FROM agents WHERE tenant_id=? AND state <> 'deleted' ORDER BY created_at DESC", $u['tenant_id']);
-    json_out(array_map(fn($a) => public_agent($a, active_job($a['id'])), $rows));
+    json_out(array_map(fn($a) => public_agent($a, active_job($a['id'], $u['tenant_id'])), $rows));
 }
 
 if ($route('GET', '/api/agents/([0-9a-f-]+)')) {
     $a = get_agent($m[1], $u);
-    $events = q('SELECT timestamp, type, state, result, duration_ms, job_id FROM events WHERE agent_id=? ORDER BY id DESC LIMIT 40', $a['id']);
+    $events = q(
+        'SELECT timestamp, type, state, result, duration_ms, job_id FROM events WHERE agent_id=? AND tenant_id=? ORDER BY id DESC LIMIT 40',
+        $a['id'],
+        $u['tenant_id']
+    );
     foreach ($events as &$e) {
         $e['timestamp'] = (new DateTimeImmutable($e['timestamp']))->format(DATE_ATOM);
         $e['duration_ms'] = $e['duration_ms'] !== null ? (int)$e['duration_ms'] : null;
     }
-    json_out(public_agent($a, active_job($a['id'])) + ['events' => $events]);
+    json_out(public_agent($a, active_job($a['id'], $u['tenant_id'])) + ['events' => $events]);
 }
 
 if ($route('POST', '/api/agents/([0-9a-f-]+)/switch')) {
     $a = get_agent($m[1], $u);
     $b = body();
-    if (!is_bool($b['enabled'] ?? null)) fail(422, 'Invalid request: enabled');
+    if (!is_bool($b['enabled'] ?? null)) {
+        fail(422, 'Invalid request: enabled');
+    }
     $on = $b['enabled'];
     $type = $on ? ($a['state'] === 'failed' ? 'create' : 'enable') : 'disable';
-    if (enqueue($a, $type) === null) fail(409, 'A change is already in progress for this agent');
-    q('UPDATE agents SET enabled=?, state=? WHERE id=?', $on, $on ? 'starting' : 'stopping', $a['id']);
+    if (enqueue($a, $type) === null) {
+        fail(409, 'A change is already in progress for this agent');
+    }
+    q('UPDATE agents SET enabled=?, state=? WHERE id=? AND tenant_id=?', $on, $on ? 'starting' : 'stopping', $a['id'], $u['tenant_id']);
     event($a['tenant_id'], $a['id'], $on ? 'switch_on' : 'switch_off', 'requested');
-    json_out(public_agent(q1('SELECT * FROM agents WHERE id=?', $a['id']), active_job($a['id'])));
+    json_out(public_agent(
+        q1('SELECT * FROM agents WHERE id=? AND tenant_id=?', $a['id'], $u['tenant_id']),
+        active_job($a['id'], $u['tenant_id'])
+    ));
 }
 
 if ($route('DELETE', '/api/agents/([0-9a-f-]+)')) {
     $a = get_agent($m[1], $u);
-    if (enqueue($a, 'delete') === null) fail(409, 'A change is already in progress for this agent');
+    if (enqueue($a, 'delete') === null) {
+        fail(409, 'A change is already in progress for this agent');
+    }
     event($a['tenant_id'], $a['id'], 'delete', 'requested');
     json_out(['ok' => true]);
 }
@@ -179,14 +242,22 @@ if ($route('POST', '/api/agentfather/sessions')) {
     $sid = uuid4();
     $first = af_next([]);
     $msgs = [['role' => 'assistant', 'content' => AF_GREETING], ['role' => 'assistant', 'content' => af_prompt($first)]];
-    q('INSERT INTO agentfather_sessions(id, tenant_id, user_id, messages, draft_config) VALUES (?,?,?,?::jsonb,?::jsonb)',
-      $sid, $u['tenant_id'], $u['id'], json_encode($msgs), json_encode(['answers' => new stdClass(), 'asking' => $first]));
+    q(
+        'INSERT INTO agentfather_sessions(id, tenant_id, user_id, messages, draft_config) VALUES (?,?,?,?::jsonb,?::jsonb)',
+        $sid,
+        $u['tenant_id'],
+        $u['id'],
+        json_encode($msgs),
+        json_encode(['answers' => new stdClass(), 'asking' => $first])
+    );
     json_out(session_out(get_session($sid, $u)));
 }
 
 if ($route('POST', '/api/agentfather/sessions/([0-9a-f-]+)/messages')) {
     $s = get_session($m[1], $u);
-    if ($s['status'] !== 'open') fail(409, 'This conversation is closed');
+    if ($s['status'] !== 'open') {
+        fail(409, 'This conversation is closed');
+    }
     $b = body();
     $state = $s['draft_config'] ?? ['answers' => [], 'asking' => af_next([])];
     $state['answers'] = (array)($state['answers'] ?? []);
@@ -196,51 +267,34 @@ if ($route('POST', '/api/agentfather/sessions/([0-9a-f-]+)/messages')) {
     } else {
         $choices = $b['choices'] ?? [];
         $text = $b['text'] ?? '';
-        if (!is_array($choices) || !is_string($text) || mb_strlen($text) > 4000) fail(422, 'Invalid request');
+        if (!is_array($choices) || !is_string($text) || mb_strlen($text) > 4000) {
+            fail(422, 'Invalid request');
+        }
         $choices = array_values(array_filter($choices, 'is_string'));
         [$new, $err, $shown] = af_answer($state, $choices, $text);
-        if ($err !== null) json_out(session_out($s, $err));
+        if ($err !== null) {
+            json_out(session_out($s, $err));
+        }
     }
     $msgs = [...$s['messages'], ['role' => 'user', 'content' => $shown], ['role' => 'assistant', 'content' => af_prompt($new['asking'])]];
-    q('UPDATE agentfather_sessions SET messages=?::jsonb, draft_config=?::jsonb WHERE id=?',
-      json_encode($msgs), json_encode(['answers' => (object)$new['answers'], 'asking' => $new['asking']]), $s['id']);
+    q(
+        'UPDATE agentfather_sessions SET messages=?::jsonb, draft_config=?::jsonb WHERE id=? AND tenant_id=? AND user_id=?',
+        json_encode($msgs),
+        json_encode(['answers' => (object)$new['answers'], 'asking' => $new['asking']]),
+        $s['id'],
+        $u['tenant_id'],
+        $u['id']
+    );
     json_out(session_out(get_session($s['id'], $u)));
 }
 
 if ($route('POST', '/api/agentfather/sessions/([0-9a-f-]+)/confirm')) {
-    $s = get_session($m[1], $u);
-    if ($s['status'] !== 'open') fail(409, 'This conversation is already closed');
-    $state = $s['draft_config'] ?? [];
-    if (!array_key_exists('asking', $state) || $state['asking'] !== null) fail(422, 'Answer all of AgentFather\'s questions first.');
-    [$cfg, $err] = validate_config(af_build_config((array)($state['answers'] ?? [])));
-    if (!$cfg) fail(422, 'Configuration rejected by the platform: ' . ($err ?? 'incomplete'));
-    if ($cfg['channel_type'] === 'whatsapp') fail(422, 'WhatsApp is not available in this POC yet. Click Change and choose Telegram.');
-    $b = body();
-    if (array_diff(array_keys($b), ['telegram_token'])) fail(422, 'Invalid request: unknown fields');
-    $token = trim((string)($b['telegram_token'] ?? ''));
-    if ($token === '') fail(422, 'Paste the Telegram bot token from @BotFather.');
-    // The token goes straight to the broker's secrets store; only a reference is kept here.
-    try {
-        $sec = broker('POST', '/secrets', ['kind' => 'telegram', 'value' => $token]);
-    } catch (StepError $e) {
-        $code = $e->getCode();
-        fail($code >= 400 && $code < 500 ? $code : 502, $e->getMessage());
-    }
-    $aid = uuid4();
-    q("INSERT INTO agents(id, tenant_id, name, job, instructions, prohibited_tasks, channel_type, channel_account,
-         secret_ref, enabled, state, runtime, model, allowed_users) VALUES (?,?,?,?,?,?::jsonb,?,?,?,true,'starting',?,?,?::jsonb)",
-      $aid, $u['tenant_id'], $cfg['name'], $cfg['job'], $cfg['instructions'], json_encode($cfg['prohibited_tasks']),
-      $cfg['channel_type'], $sec['account'], $sec['secret_ref'], $cfg['runtime'], $cfg['model'], json_encode($cfg['allowed_users']));
-    q("UPDATE agentfather_sessions SET status='confirmed' WHERE id=?", $s['id']);
-    $a = q1('SELECT * FROM agents WHERE id=?', $aid);
-    event($u['tenant_id'], $aid, 'config_validated', 'completed');
-    enqueue($a, 'create');
-    json_out(public_agent($a, active_job($aid)));
+    json_out(confirm_agent_session($m[1], $u, body()));
 }
 
 if ($route('POST', '/api/agentfather/sessions/([0-9a-f-]+)/cancel')) {
     $s = get_session($m[1], $u);
-    q("UPDATE agentfather_sessions SET status='cancelled' WHERE id=? AND status='open'", $s['id']);
+    q("UPDATE agentfather_sessions SET status='cancelled' WHERE id=? AND tenant_id=? AND user_id=? AND status='open'", $s['id'], $u['tenant_id'], $u['id']);
     json_out(['ok' => true]);
 }
 

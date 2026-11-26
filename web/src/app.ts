@@ -126,10 +126,17 @@ const $ = <T extends HTMLElement = HTMLElement>(sel: string): T => {
 const esc = (s: unknown): string =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'})[c] as string);
 
+let csrfToken = '';
+
 async function api<T>(path: string, opts: {method?: string; body?: unknown} = {}): Promise<T> {
+  const method = opts.method ?? 'GET';
+  const headers: Record<string, string> = {'content-type': 'application/json'};
+  if (method !== 'GET' && csrfToken) {
+    headers['X-CSRF-Token'] = csrfToken;
+  }
   const r = await fetch('/api' + path, {
-    method: opts.method ?? 'GET',
-    headers: {'content-type': 'application/json'},
+    method,
+    headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
   });
   if (r.status === 401) {
@@ -453,7 +460,8 @@ $('#rows').addEventListener('click', async (e) => {
 });
 
 void (async () => {
-  const me = await api<{email: string}>('/me');
+  const me = await api<{email: string; csrf_token?: string}>('/me');
+  csrfToken = me.csrf_token ?? '';
   $('#me').textContent = me.email;
   await refresh();
   setInterval(() => void refresh(), 2000);

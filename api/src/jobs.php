@@ -6,13 +6,38 @@ require_once __DIR__ . '/db.php';
 
 final class StepError extends RuntimeException {}
 
+/** @internal Allows tests to inject a fake broker handler without HTTP/Docker. */
+function set_broker_handler(?callable $handler): void
+{
+    broker_handler($handler, true);
+}
+
+function broker_handler(?callable $override = null, bool $replace = false): ?callable
+{
+    static $handler = null;
+    if ($replace) {
+        $handler = $override;
+    }
+    return $handler;
+}
+
 /** Calls the Deployment Broker. Errors become StepError with a safe message (never a secret). */
 function broker(string $method, string $path, ?array $json = null, array $query = []): array
 {
-    $url = rtrim(getenv('BROKER_URL'), '/') . $path . ($query ? '?' . http_build_query($query) : '');
+    $custom = broker_handler();
+    if ($custom !== null) {
+        return $custom($method, $path, $json, $query);
+    }
+
+    $url = rtrim((string)getenv('BROKER_URL'), '/') . $path . ($query ? '?' . http_build_query($query) : '');
     $ch = curl_init($url);
     $headers = ['X-Broker-Token: ' . getenv('BROKER_TOKEN')];
-    $opts = [CURLOPT_CUSTOMREQUEST => $method, CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 150, CURLOPT_CONNECTTIMEOUT => 5];
+    $opts = [
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => 150,
+        CURLOPT_CONNECTTIMEOUT => 5,
+    ];
     if ($json !== null) {
         $headers[] = 'Content-Type: application/json';
         $opts[CURLOPT_POSTFIELDS] = json_encode($json);
@@ -22,7 +47,9 @@ function broker(string $method, string $path, ?array $json = null, array $query 
     $body = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     curl_close($ch);
-    if ($body === false || $code === 0) throw new StepError('Deployment broker unreachable');
+    if ($body === false || $code === 0) {
+        throw new StepError('Deployment broker unreachable');
+    }
     $data = json_decode($body, true);
     if ($code >= 400) {
         $detail = is_array($data) && is_string($data['detail'] ?? null) ? $data['detail'] : "broker error HTTP $code";
@@ -31,15 +58,29 @@ function broker(string $method, string $path, ?array $json = null, array $query 
     return is_array($data) ? $data : [];
 }
 
-/** @return string|null job id, or null if a job is already in flight for this agent */
+/**
+ * Enqueues a job for an agent.
+ * Returns null ONLY on unique-index violation (SQLSTATE 23505 on one_active_job_per_agent).
+ * Other PDO errors are logged safely and rethrown.
+ */
 function enqueue(array $agent, string $type): ?string
 {
     $id = uuid4();
     try {
-        q("INSERT INTO jobs(id, tenant_id, agent_id, type, state, idempotency_key) VALUES (?,?,?,?,'queued',?)",
-          $id, $agent['tenant_id'], $agent['id'], $type, "{$agent['id']}:$type:$id");
-    } catch (PDOException) { // unique index one_active_job_per_agent
-        return null;
+        q(
+            "INSERT INTO jobs(id, tenant_id, agent_id, type, state, idempotency_key) VALUES (?,?,?,?,'queued',?)",
+            $id,
+            $agent['tenant_id'],
+            $agent['id'],
+            $type,
+            "{$agent['id']}:$type:$id"
+        );
+    } catch (PDOException $e) {
+        if ((string)$e->getCode() === '23505' && str_contains($e->getMessage(), 'one_active_job_per_agent')) {
+            return null;
+        }
+        error_log('enqueue error: SQLSTATE ' . $e->getCode());
+        throw $e;
     }
     event($agent['tenant_id'], $agent['id'], "job_{$type}_queued", 'queued', null, $id);
     return $id;
@@ -48,9 +89,15 @@ function enqueue(array $agent, string $type): ?string
 function manifest(array $a): array
 {
     return [
-        'agent_id' => $a['id'], 'name' => $a['name'], 'job' => $a['job'], 'instructions' => $a['instructions'],
-        'prohibited_tasks' => json_decode($a['prohibited_tasks'], true), 'channel_type' => $a['channel_type'],
-        'secret_ref' => $a['secret_ref'], 'runtime' => $a['runtime'], 'model' => $a['model'],
+        'agent_id' => $a['id'],
+        'name' => $a['name'],
+        'job' => $a['job'],
+        'instructions' => $a['instructions'],
+        'prohibited_tasks' => json_decode($a['prohibited_tasks'], true),
+        'channel_type' => $a['channel_type'],
+        'secret_ref' => $a['secret_ref'],
+        'runtime' => $a['runtime'],
+        'model' => $a['model'],
         'allowed_users' => json_decode($a['allowed_users'], true),
     ];
 }
@@ -61,15 +108,80 @@ function set_agent(string $id, array $fields): void
     q("UPDATE agents SET $cols WHERE id=?", ...[...array_values($fields), $id]);
 }
 
+function renew_job_lease(string $jid, int $seconds = 180): void
+{
+    q(
+        "UPDATE jobs SET lease_expires_at = now() + (? * interval '1 second'), updated_at=now() WHERE id=? AND state='running'",
+        $seconds,
+        $jid
+    );
+}
+
+/**
+ * Recovers interrupted or stale-lease jobs without losing them or wrongly failing agents.
+ * - On worker startup ($startup = true), any 'running' job belonged to the previous dead worker and is re-queued.
+ * - Periodically ($startup = false), any 'running' job with an expired lease is re-queued.
+ * - Any interrupted 'rolling_back' job completes best-effort cleanup and is marked failed.
+ */
+function recover_interrupted_jobs(bool $startup = false): int
+{
+    $recovered = 0;
+    $runningSql = $startup
+        ? "SELECT * FROM jobs WHERE state='running'"
+        : "SELECT * FROM jobs WHERE state='running' AND (lease_expires_at IS NULL OR lease_expires_at < now())";
+
+    foreach (q($runningSql) as $j) {
+        q(
+            "UPDATE jobs SET state='queued', current_step=NULL, lease_expires_at=NULL, updated_at=now() WHERE id=? AND state='running'",
+            $j['id']
+        );
+        event($j['tenant_id'], $j['agent_id'], 'job_recovered', 'queued', 'Re-queued after worker interruption', $j['id']);
+        $recovered++;
+    }
+
+    $rbSql = $startup
+        ? "SELECT * FROM jobs WHERE state='rolling_back'"
+        : "SELECT * FROM jobs WHERE state='rolling_back' AND (lease_expires_at IS NULL OR lease_expires_at < now())";
+
+    foreach (q($rbSql) as $j) {
+        $a = q1('SELECT * FROM agents WHERE id=?', $j['agent_id']);
+        if ($a) {
+            try {
+                broker('DELETE', "/agents/{$a['id']}", null, ['secret_ref' => $a['secret_ref'] ?? '', 'keep_secret' => 'true']);
+            } catch (StepError) {
+                // Cleanup will run again on retry.
+            }
+            set_agent($a['id'], [
+                'state' => 'failed',
+                'enabled' => false,
+                'container_id' => null,
+                'state_reason' => 'Interrupted during rollback; retry to re-create',
+            ]);
+        }
+        q("UPDATE jobs SET state='failed', error='Interrupted during rollback', lease_expires_at=NULL, updated_at=now() WHERE id=?", $j['id']);
+        $recovered++;
+    }
+
+    return $recovered;
+}
+
 function run_job(array $job): void
 {
     $a = q1('SELECT * FROM agents WHERE id=?', $job['agent_id']);
+    if (!$a) {
+        q("UPDATE jobs SET state='failed', error='Agent not found', lease_expires_at=NULL, updated_at=now() WHERE id=?", $job['id']);
+        return;
+    }
     $tenant = $a['tenant_id'];
     $jid = $job['id'];
     $aid = $a['id'];
 
     $step = function (string $name, callable $fn) use ($tenant, $aid, $jid) {
-        q('UPDATE jobs SET current_step=?, updated_at=now() WHERE id=?', $name, $jid);
+        q(
+            "UPDATE jobs SET current_step=?, lease_expires_at = now() + interval '180 seconds', updated_at=now() WHERE id=?",
+            $name,
+            $jid
+        );
         $t0 = microtime(true);
         try {
             $res = $fn();
@@ -91,7 +203,6 @@ function run_job(array $job): void
                         throw new StepError('WhatsApp is not available in this POC (OpenClaw only supports WhatsApp Web linking). See README.');
                     }
                 });
-                // On always rebuilds the container from the manifest, so it gets the current secrets.
                 $res = $step('create_container', fn() => broker('POST', "/agents/$aid/create", manifest($a)));
                 set_agent($aid, ['container_id' => $res['container_id']]);
                 $step('start_and_health_check', fn() => broker('POST', "/agents/$aid/start"));
@@ -107,34 +218,39 @@ function run_job(array $job): void
                 set_agent($aid, ['state' => 'deleted', 'enabled' => false, 'container_id' => null]);
                 break;
         }
-        q("UPDATE jobs SET state='completed', current_step=NULL, updated_at=now() WHERE id=?", $jid);
+        q("UPDATE jobs SET state='completed', current_step=NULL, lease_expires_at=NULL, updated_at=now() WHERE id=?", $jid);
     } catch (Throwable $e) {
         $reason = $e instanceof StepError ? $e->getMessage() : 'Unexpected error in the platform';
-        if (!$e instanceof StepError) error_log("job $jid crashed: " . get_class($e));
+        if (!$e instanceof StepError) {
+            error_log("job $jid crashed: " . get_class($e));
+        }
         $failedStep = q1('SELECT current_step FROM jobs WHERE id=?', $jid)['current_step'] ?? null;
         if (in_array($job['type'], ['create', 'enable'], true)) {
-            // Safe failure: remove what was created (keep the channel secret so a retry works).
-            q("UPDATE jobs SET state='rolling_back', updated_at=now() WHERE id=?", $jid);
+            q("UPDATE jobs SET state='rolling_back', lease_expires_at = now() + interval '180 seconds', updated_at=now() WHERE id=?", $jid);
             try {
                 broker('DELETE', "/agents/$aid", null, ['secret_ref' => $a['secret_ref'] ?? '', 'keep_secret' => 'true']);
                 event($tenant, $aid, 'rollback', 'completed', null, $jid);
             } catch (StepError $e2) {
                 event($tenant, $aid, 'rollback', 'failed', $e2->getMessage() . ' (cleanup will run on retry)', $jid);
             }
-            set_agent($aid, ['state' => 'failed', 'enabled' => false, 'container_id' => null,
-                             'state_reason' => "$reason (step: $failedStep)"]);
+            set_agent($aid, [
+                'state' => 'failed',
+                'enabled' => false,
+                'container_id' => null,
+                'state_reason' => "$reason (step: $failedStep)",
+            ]);
         } elseif ($job['type'] === 'delete') {
             set_agent($aid, ['state' => 'failed', 'state_reason' => "Delete failed: $reason"]);
         } else {
             set_agent($aid, ['state' => 'failed', 'state_reason' => $reason]);
         }
-        q("UPDATE jobs SET state='failed', error=?, updated_at=now() WHERE id=?", $reason, $jid);
+        q("UPDATE jobs SET state='failed', error=?, lease_expires_at=NULL, updated_at=now() WHERE id=?", $reason, $jid);
     }
 }
 
 function claim_job(): ?array
 {
-    return q1("UPDATE jobs SET state='running', updated_at=now() WHERE id = (
+    return q1("UPDATE jobs SET state='running', lease_expires_at = now() + interval '180 seconds', updated_at=now() WHERE id = (
                  SELECT id FROM jobs WHERE state='queued' ORDER BY created_at
                  FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *");
 }
