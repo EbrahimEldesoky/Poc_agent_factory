@@ -353,6 +353,14 @@ test('Docker cleanup failure throws instead of reporting success', function () {
     // Idempotent 404s succeed
     remove_all($id, fn() => [404, '{"message":"no such"}'], 'af-egress');
 
+    // Docker 29: disconnecting egress from a network that does not exist yet answers 500 "not connected"
+    remove_all($id, function (string $method, string $path): array {
+        if (str_ends_with($path, '/disconnect')) {
+            return [500, '{"message":"container abc is not connected to the network af-net-x"}'];
+        }
+        return [404, '{"message":"not found"}'];
+    }, 'af-egress');
+
     // HTTP 500 on volume delete throws
     assert_throws(RuntimeException::class, function () use ($id) {
         remove_all($id, function (string $method, string $path): array {

@@ -167,7 +167,8 @@ function remove_all(string $id, ?callable $transport = null, ?string $egressCont
             return;
         }
         $msg = json_decode($res, true)['message'] ?? "HTTP $code";
-        if ($allowNotConnected && $code === 409 && stripos($msg, 'not connected') !== false) {
+        // Docker < 29 answers 404/409; Docker 29 answers 500 when the network does not exist.
+        if ($allowNotConnected && stripos($msg, 'not connected') !== false) {
             return;
         }
         throw new RuntimeException("Docker cleanup $method " . strtok($path, '?') . " failed: $msg");
