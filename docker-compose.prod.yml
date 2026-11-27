@@ -1,0 +1,36 @@
+# Production overrides, used with:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# Adds Caddy for automatic HTTPS and keeps the web container off the public interfaces.
+
+services:
+  web:
+    ports: !reset []
+    restart: unless-stopped
+
+  db:
+    restart: unless-stopped
+
+  api:
+    environment:
+      COOKIE_SECURE: "true"
+      TRUST_PROXY: "true"
+
+  caddy:
+    image: caddy:2.8.4-alpine
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web: { condition: service_healthy }
+    networks: [platform]
+    restart: unless-stopped
+
+volumes:
+  caddy_data: {}
+  caddy_config: {}

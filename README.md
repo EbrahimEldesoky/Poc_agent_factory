@@ -187,8 +187,16 @@ The test stack is isolated (own project, port and egress), so it can run next to
 to cut running agents off their network. The broker now re-attaches egress to every agent network on its
 healthcheck (≤ 30 s).
 
-**No deployment pipeline yet**: the project runs locally only. CI checks every push; there is no CD stage
-until a production environment exists.
+**CD** (`.github/workflows/cd.yml`): after CI passes on a push to `main`, GitHub uploads the code to the
+server over SSH and runs `deploy/remote-deploy.sh`, which rebuilds the stack with `docker-compose.prod.yml`
+(Caddy adds automatic HTTPS on ports 80/443). The first run creates `.env` with fresh secrets on the server;
+they never leave it. The job is skipped while the `DEPLOY_*` repository secrets are missing.
+
+Manual deploy from a machine with SSH access:
+```bash
+git archive HEAD | ssh user@host 'mkdir -p ~/agent-factory && tar -xf - -C ~/agent-factory'
+ssh user@host 'cd ~/agent-factory && SITE_ADDRESS=1-2-3-4.sslip.io sh deploy/remote-deploy.sh'
+```
 
 Reviewed exceptions: `.gitleaksignore` (two fake values in test fixtures) and `.trivyignore.yaml`
 (the broker runs as root because it must open the Docker socket).

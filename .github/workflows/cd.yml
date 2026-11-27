@@ -1,0 +1,71 @@
+name: CD
+
+# Deploys main to the server after CI succeeds on a push (or on demand).
+# Required repository secrets (the job is skipped with a notice when they are missing):
+#   DEPLOY_HOST          server IP or hostname
+#   DEPLOY_USER          SSH user (member of the docker group)
+#   DEPLOY_SSH_KEY       private key dedicated to this workflow
+#   DEPLOY_KNOWN_HOSTS   output of: ssh-keyscan <host>
+# Server secrets (.env) are created on the server at the first deploy and never leave it.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+    steps:
+      - name: Check secrets
+        id: gate
+        run: |
+          if [ -z "$DEPLOY_HOST" ] || [ -z "$DEPLOY_USER" ] || [ -z "$DEPLOY_SSH_KEY" ] || [ -z "$DEPLOY_KNOWN_HOSTS" ]; then
+            echo "::notice::Deploy secrets are not set, skipping"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.ok == 'true'
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up SSH
+        if: steps.gate.outputs.ok == 'true'
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Upload code
+        if: steps.gate.outputs.ok == 'true'
+        run: git archive --format=tar.gz HEAD | ssh "$DEPLOY_USER@$DEPLOY_HOST" 'mkdir -p ~/agent-factory && tar -xzf - -C ~/agent-factory'
+
+      - name: Build and restart
+        if: steps.gate.outputs.ok == 'true'
+        run: ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sh ~/agent-factory/deploy/remote-deploy.sh'
+
+      - name: Check the public site
+        if: steps.gate.outputs.ok == 'true'
+        run: |
+          site=$(ssh "$DEPLOY_USER@$DEPLOY_HOST" 'sed -n "s/^SITE_ADDRESS=//p" ~/agent-factory/.env')
+          curl -fsS --retry 5 --retry-delay 3 --retry-all-errors -o /dev/null "https://$site/login"
+          echo "Deployed to https://$site"
